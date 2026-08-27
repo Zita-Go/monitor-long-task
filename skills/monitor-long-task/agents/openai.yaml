@@ -1,0 +1,4 @@
+interface:
+  display_name: "Monitor Long Task / 长任务监控"
+  short_description: "后台监控长任务，验证成功后发送飞书或 Lark 通知"
+  default_prompt: "使用 $monitor-long-task 后台运行这个长任务，并在验证成功后发送飞书通知。"

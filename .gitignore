@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.coverage
+.pytest_cache/
+.venv/
+htmlcov/
+
+.env
+*.log
+feishu-long-task-webhook
+long-task-monitors/
+runtime/
