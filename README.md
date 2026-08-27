@@ -11,7 +11,7 @@ A Codex skill that supervises detached long-running commands or explicit complet
 - 不依赖 Codex 的 `agent-turn-complete` 事件，避免把普通回合结束误判成外部任务成功。
 - 将 `state.json`、终态 `summary.json` 和任务日志写入私有状态目录。
 - 区分任务失败、监控超时和通知失败。
-- 成功消息固定为 `【项目】：完成简洁表述`。
+- 成功消息采用固定、简洁且不泄露日志的文本格式，详见[通知内容](#通知内容)。
 - 仅使用 Python 标准库，无第三方运行时依赖。
 
 ## 要求
@@ -33,7 +33,26 @@ bash scripts/install.sh
 
 安装脚本不会覆盖已有 Skill。安装后，重新加载 Codex 任务以刷新 Skill 列表。
 
-## 配置 webhook
+## 创建飞书 webhook
+
+本项目使用的是“群自定义机器人”的入站 webhook，不需要创建飞书企业自建应用。飞书界面的具体文字可能随客户端版本略有变化，完整说明以[飞书官方《自定义机器人使用指南》](https://open.feishu.cn/document/client-docs/bot-v3/add-custom-bot)为准。
+
+1. 在飞书中新建或打开一个用于接收通知的群聊。
+2. 打开群设置，进入“群机器人”或“机器人”，选择“添加机器人”。
+3. 选择“自定义机器人”，填写名称，例如 `Codex Long Task Monitor`。
+4. 配置安全设置：
+   - 最简单：启用关键词校验并填写 `完成`，本项目的所有成功消息都包含这个词；
+   - 有固定公网出口时：也可以使用 IP 白名单；
+   - `v0.1.x` 尚未生成签名参数，因此不要启用“签名校验”，否则飞书会拒绝消息。
+5. 完成创建并复制形如以下格式的 webhook 地址：
+
+```text
+https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+```
+
+Webhook 本身相当于发送凭据。不要把真实地址写进 README、Issue、命令参数、Git 历史或发给 Agent；如果地址已经泄露，应在飞书中删除或重新生成机器人 webhook。
+
+## 保存 webhook
 
 不要把 webhook 写进仓库、命令参数或聊天内容。运行交互式配置命令，输入内容不会回显：
 
@@ -43,6 +62,82 @@ python3 "$MONITOR" configure
 ```
 
 默认密钥位置为 `${CODEX_HOME:-$HOME/.codex}/secrets/feishu-long-task-webhook`，文件权限为 `0600`。如需替换现有配置，使用 `configure --force`。
+
+### 验证 webhook
+
+配置完成后，可以托管一个立即成功的命令进行端到端测试：
+
+```bash
+python3 "$MONITOR" launch \
+  --project "monitor-long-task" \
+  --summary "Webhook 联调" \
+  --cwd "$PWD" \
+  --timeout-minutes 1 \
+  -- true
+```
+
+飞书中应收到：
+
+```text
+【monitor-long-task】：完成Webhook 联调
+```
+
+常见飞书错误：
+
+| 错误码 | 含义 | 处理方式 |
+|---|---|---|
+| `19001` | webhook 地址无效 | 重新复制机器人 webhook |
+| `19024` | 消息未包含安全关键词 | 将机器人关键词设为 `完成`，或调整安全策略 |
+| `19022` | 来源 IP 不在白名单 | 加入实际出口 IP，或改用关键词校验 |
+| `19021` | 签名不匹配 | 当前版本应关闭签名校验 |
+
+## 通知内容
+
+监控器不会在 Agent 结束当前回合时发送消息。只有满足以下任一真实成功条件后才发送：
+
+- `launch` 托管的命令结束，且退出码为 `0`；
+- `watch` 的完成检查返回 `0`。
+
+飞书或 Lark 收到的是一条纯文本消息，不是卡片。格式固定为：
+
+```text
+【<项目名>】：完成<简洁结果表述>
+```
+
+字段来源：
+
+- `<项目名>` 来自 `--project`；省略时从 Git 仓库根目录名或 `--cwd` 目录名推断。
+- `<简洁结果表述>` 来自 `--summary`；脚本会去掉重复的“完成”前缀、合并换行与多余空白，并限制在 80 个字符内。
+
+例如：
+
+```bash
+python3 "$MONITOR" launch \
+  --project "demo-project" \
+  --summary "TB2.1 全量评测" \
+  --cwd "/absolute/path/to/demo-project" \
+  --timeout-minutes 240 \
+  -- python3 run_eval.py
+```
+
+成功后实际收到：
+
+```text
+【demo-project】：完成TB2.1 全量评测
+```
+
+对应的飞书/Lark webhook payload 为：
+
+```json
+{
+  "msg_type": "text",
+  "content": {
+    "text": "【demo-project】：完成TB2.1 全量评测"
+  }
+}
+```
+
+通知中不会包含命令、日志、工作目录、用户原始提示或 webhook。`failed`、`start_failed`、`monitor_failed` 和 `timed_out` 不发送“完成”消息；`completed_notification_failed` 表示任务已经成功，但消息未送达，可使用 `retry-notification` 重发同一条消息。
 
 ## 使用
 
