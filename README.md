@@ -5,74 +5,152 @@
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](https://www.python.org/)
 [![License](https://img.shields.io/github/license/Zita-Go/monitor-long-task)](LICENSE)
 
-A Codex skill that supervises long-running work, records structured state, and sends Feishu/Lark notifications only after verified success.
+A Codex skill for detached long-running tasks, verified Feishu/Lark notifications, and event-driven continuation in the exact originating Codex session.
 
-这是一个面向 Codex 的长任务监控 Skill：Agent 启动后台任务后即可结束当前回合；任务真实完成时发送飞书/Lark，也可以选择事件驱动地续接原 Codex 会话。
+这是一个面向 Codex 的长任务 Skill：安装并配置一次后，用户只需正常描述任务。Agent 会选择监控方式、启动后台任务，并在真实终态发生时发送飞书/Lark；需要时还可以无轮询地续接启动任务的原 Codex 会话。
 
-## 30 秒快速开始
+> **正常使用不需要手动运行 `long_task_monitor.py`、`launch` 或 `watch`。** 这些命令是 Agent 的实现细节，只在集成开发和故障排查时需要。
 
-下面假设你已经有飞书/Lark 自定义机器人 webhook；如果没有，先看[创建 webhook](#创建-webhook)。
+## 目录
+
+- [普通用户：三步开始](#普通用户三步开始)
+- [重点：事件驱动续接原 Codex 会话](#重点事件驱动续接原-codex-会话)
+- [Agent 如何工作](#agent-如何工作)
+- [安装、更新与卸载](#安装更新与卸载)
+- [创建 webhook](#创建-webhook)
+- [高级 CLI 参考](#高级-cli-参考)
+- [通知内容](#通知内容)
+- [状态与故障排查](#状态与故障排查)
+- [安全边界](#安全边界)
+
+## 普通用户：三步开始
+
+### 1. 安装 Skill
 
 ```bash
 git clone https://github.com/Zita-Go/monitor-long-task.git
 cd monitor-long-task
 bash scripts/install.sh
+```
 
+安装后重新加载 Codex 任务，使 Skill 列表刷新。
+
+### 2. 只配置一次 webhook
+
+Webhook 是凭据，不能发到聊天中。请在自己的终端运行：
+
+```bash
 MONITOR="${CODEX_HOME:-$HOME/.codex}/skills/monitor-long-task/scripts/long_task_monitor.py"
 python3 "$MONITOR" configure
-
-python3 "$MONITOR" launch \
-  --project "monitor-long-task" \
-  --summary "Webhook 联调" \
-  --cwd "$PWD" \
-  --timeout-minutes 1 \
-  -- true
 ```
 
-配置时输入的 webhook 不会回显。最后一个命令成功后，群里应收到：
+输入不会回显。配置默认保存在 `${CODEX_HOME:-$HOME/.codex}/secrets/feishu-long-task-webhook`，权限为 `0600`。
+
+没有 webhook 时，先看[创建 webhook](#创建-webhook)。
+
+### 3. 以后只需正常告诉 Agent
+
+只需要完成通知：
 
 ```text
-【monitor-long-task】：完成Webhook 联调
+帮我跑完整评测，这是长任务，结束后飞书通知我。
 ```
 
-## 选择模式
+任务结束后还要回到当前会话继续处理：
 
-| 你的任务 | 使用方式 | 是否轮询 |
+```text
+启动训练；任务结束后回到当前会话，读取最终产物并继续汇总。
+```
+
+等待外部系统产生结果：
+
+```text
+启动导入任务并等待最终产物出现，完成后飞书通知我。
+```
+
+Agent 会自行决定项目名、摘要、超时时间、使用 `launch` 还是 `watch`，以及是否启用原会话续接。若任务意图不明显，也可以显式提到 `$monitor-long-task`。
+
+成功时飞书/Lark 收到：
+
+```text
+【<项目名>】：完成<简洁结果表述>
+```
+
+例如：
+
+```text
+【demo-project】：完成TB2.1 全量评测
+```
+
+## 重点：事件驱动续接原 Codex 会话
+
+这是本项目区别于普通通知脚本的核心能力。
+
+当用户要求“任务结束后回到原会话继续处理”时，Agent 会启用 `--resume-origin-session` 并根据任务上下文自行编写续接消息。任务进入成功、失败或超时等终态后，worker 使用启动时捕获的精确 `CODEX_THREAD_ID`，单次调用官方 [`codex exec resume`](https://learn.chatgpt.com/docs/developer-commands#codex-exec)：
+
+```text
+codex exec resume <原线程ID> -
+```
+
+消息经 stdin 传递，不出现在进程参数中。新的 Codex turn 会回到原会话，读取状态、检查产物并自行决定后续工作。
+
+这个过程：
+
+- 由任务终态事件直接触发；
+- 不创建 Automation 或定时任务；
+- 不轮询原会话；
+- 不使用容易误选会话的 `--last`；
+- 每个监控任务最多派发一次；
+- 失败时只记录日志，不自动重试。
+
+续接消息不是脚本写死的。Agent 可在消息中引用 `{status}`、`{summary_file}`、`{task_log}`、`{exit_code}` 和 `{error}` 等终态字段。例如：
+
+```bash
+--resume-origin-session \
+--session-message '后台任务已进入 {status}。请读取 {summary_file} 和 {task_log}，基于真实结果自行继续原任务；不要重新启动该任务。'
+```
+
+续接会产生一个额外 Codex turn，因此默认关闭。只有用户表达“回到原会话继续处理”的意图时，Agent 才应启用。
+
+## Agent 如何工作
+
+```mermaid
+flowchart LR
+    U[用户自然语言请求] --> A[Codex Agent]
+    A --> M[monitor-long-task]
+    M --> T[后台长任务]
+    T -->|终态事件| M
+    M -->|验证成功| F[飞书 / Lark]
+    M -->|可选：单次 resume| C[精确原 Codex 会话]
+```
+
+普通用户不需要选择 CLI 参数。Agent 根据意图处理：
+
+| 用户意图 | Agent 行为 | 是否轮询 |
 |---|---|---|
-| 可以保持前台运行的构建、测试、训练命令 | `launch` 托管命令 | 否，等待进程退出 |
-| 已在外部启动、会自行 daemonize，或只能检查产物的任务 | `watch` 检查完成条件 | 是，只轮询显式检查命令 |
-| 只需要飞书/Lark 通知 | 不加会话续接参数 | 不涉及 |
-| 结束后让原 Codex 会话继续处理 | 加 `--resume-origin-session` | 否，终态时单次派发 |
+| 托管本地构建、测试或训练命令 | 使用 `launch` 等待进程退出 | 否 |
+| 等待外部任务、明确标记或最终产物 | 使用 `watch` 检查完成条件 | 是，只检查显式外部条件 |
+| 只要求完成后通知 | 不启用原会话续接 | 不涉及 |
+| 要求结束后继续分析或汇总 | 启用 `--resume-origin-session` | 否，终态时单次派发 |
+| 普通短命令 | 不使用该 Skill | 不涉及 |
 
 默认行为：
 
-- 原会话续接默认关闭，避免产生未经请求的额外 Codex turn。
-- 飞书/Lark 只在任务真实成功后发送；失败和超时不会伪装成“完成”。
-- 监控超时不会自动杀死真实任务。
-- 原会话续接只派发一次，不使用 `--last`，不轮询，也不自动重试。
+- 飞书/Lark 只在验证成功后发送；失败和超时不伪装成“完成”。
+- 原会话续接默认关闭，避免未经请求的额外 Codex turn。
+- 原会话续接本身从不轮询；`watch` 只服务于无法直接托管的外部条件。
+- 超时不会自动杀死仍在运行的真实任务。
 
-## 目录
+## 安装、更新与卸载
 
-- [要求](#要求)
-- [安装、更新与卸载](#安装更新与卸载)
-- [创建 webhook](#创建-webhook)
-- [基本使用](#基本使用)
-- [飞书/Lark 通知内容](#飞书lark-通知内容)
-- [事件驱动续接原 Codex 会话](#事件驱动续接原-codex-会话)
-- [状态与故障排查](#状态与故障排查)
-- [安全边界](#安全边界)
-- [开发与验证](#开发与验证)
-
-## 要求
+### 要求
 
 - Python 3.10 或更高版本
 - Codex CLI、IDE 或 Desktop 的本地执行环境
 - Linux 或 macOS；Windows 后台进程行为尚未验证
 - 可访问飞书或 Lark 自定义机器人 webhook
 
-## 安装、更新与卸载
-
-Skill 是按 Codex host 安装的。使用多个远程主机时，需要在每台实际运行任务的主机上分别安装；webhook 和任务状态也各自保存在该主机的 `CODEX_HOME` 中。
+Skill 按 Codex host 安装。使用多个远程主机时，需要在每台实际运行任务的主机上分别安装；webhook 和任务状态也各自保存在该主机的 `CODEX_HOME` 中。
 
 ### 安装
 
@@ -89,7 +167,7 @@ bash scripts/install.sh
 skills/monitor-long-task 路径安装 monitor-long-task Skill。
 ```
 
-安装后重新加载 Codex 任务，使 Skill 列表刷新。安装器不会覆盖已有 Skill。
+安装器不会覆盖已有 Skill。
 
 ### 更新
 
@@ -115,7 +193,7 @@ bash scripts/install.sh --uninstall
 
 安装器不会直接删除 Skill，而是将其移动到 `skills/.disabled/`。Webhook 和历史状态仍会保留，方便恢复或审计。
 
-查看所有安装器选项：
+查看所有选项：
 
 ```bash
 bash scripts/install.sh --help
@@ -123,15 +201,15 @@ bash scripts/install.sh --help
 
 ## 创建 webhook
 
-本项目使用群聊里的“自定义机器人”入站 webhook，不需要创建企业自建应用。
+本项目使用群聊中的“自定义机器人”入站 webhook，不需要创建企业自建应用。
 
 1. 新建或打开一个用于接收通知的群聊。
-2. 打开群设置，进入“群机器人”或“机器人”，选择“添加机器人”。
+2. 在群设置中进入“群机器人”或“机器人”，选择“添加机器人”。
 3. 选择“自定义机器人”，填写名称，例如 `Codex Long Task Monitor`。
 4. 配置安全策略：
    - 简单场景：启用关键词校验并填写 `完成`；所有成功消息都包含这个词。
    - 有固定公网出口时：可以使用 IP 白名单。
-   - 当前版本不生成签名参数，因此不要启用签名校验。
+   - 当前版本不生成签名参数，不要启用签名校验。
 5. 创建机器人并复制 webhook 地址。
 
 飞书格式：
@@ -140,26 +218,33 @@ bash scripts/install.sh --help
 https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
 ```
 
-Lark 格式使用 `open.larksuite.com`。界面和安全设置以官方文档为准：[飞书自定义机器人](https://open.feishu.cn/document/client-docs/bot-v3/add-custom-bot)、[Lark Custom Bot](https://open.larksuite.com/document/client-docs/bot-v3/add-custom-bot)。
+Lark 使用 `open.larksuite.com`。界面和安全设置以官方文档为准：[飞书自定义机器人](https://open.feishu.cn/document/client-docs/bot-v3/add-custom-bot)、[Lark Custom Bot](https://open.larksuite.com/document/client-docs/bot-v3/add-custom-bot)。
 
-运行交互式配置命令，将 webhook 保存到权限为 `0600` 的私有文件：
+运行交互式配置命令：
 
 ```bash
 MONITOR="${CODEX_HOME:-$HOME/.codex}/skills/monitor-long-task/scripts/long_task_monitor.py"
 python3 "$MONITOR" configure
 ```
 
-默认位置：
+使用 `configure --force` 可以替换现有地址。不要把真实 webhook 放进命令参数、聊天内容、Issue 或 Git 历史；地址泄露后应立即重新生成。
 
-```text
-${CODEX_HOME:-$HOME/.codex}/secrets/feishu-long-task-webhook
+### 可选：验证 webhook
+
+普通使用无需运行测试命令。排查安装时，可以执行：
+
+```bash
+python3 "$MONITOR" launch \
+  --project "monitor-long-task" \
+  --summary "Webhook 联调" \
+  --cwd "$PWD" \
+  --timeout-minutes 1 \
+  -- true
 ```
 
-使用 `configure --force` 可以替换现有地址。不要把真实 webhook 放进命令参数、聊天内容、Issue 或 Git 历史。
+## 高级 CLI 参考
 
-## 基本使用
-
-先定义脚本路径：
+以下命令主要供 Agent、集成开发和故障排查使用。
 
 ```bash
 MONITOR="${CODEX_HOME:-$HOME/.codex}/skills/monitor-long-task/scripts/long_task_monitor.py"
@@ -176,11 +261,9 @@ python3 "$MONITOR" launch \
   -- python3 -m unittest discover -v
 ```
 
-被托管命令应保持前台运行。退出码为 `0` 才视为成功；非零退出码记录为 `failed`。会自行 daemonize 的程序应改用 `watch`。
+被托管命令应保持前台运行。退出码为 `0` 才视为成功；会自行 daemonize 的程序应改用 `watch`。
 
 ### `watch`：检查外部完成条件
-
-先确认检查命令当前返回非 `0`，启动外部任务后再运行：
 
 ```bash
 python3 "$MONITOR" watch \
@@ -202,7 +285,7 @@ python3 "$MONITOR" list --limit 20
 python3 "$MONITOR" retry-notification <task_id>
 ```
 
-## 飞书/Lark 通知内容
+## 通知内容
 
 监控器不会因为 Agent 当前回合结束就发送消息。只有 `launch` 命令退出码为 `0`，或 `watch` 完成检查返回 `0` 后才发送纯文本：
 
@@ -224,47 +307,7 @@ Webhook payload：
 }
 ```
 
-通知不会包含命令、日志、工作目录、原始用户提示或 webhook。`failed`、`start_failed`、`monitor_failed` 和 `timed_out` 不发送“完成”；`completed_notification_failed` 表示任务成功但消息未送达，可以执行 `retry-notification`。
-
-## 事件驱动续接原 Codex 会话
-
-该功能默认关闭。只有用户要求任务结束后回到原会话时，Agent 才应加入：
-
-```bash
---resume-origin-session \
---session-message '后台任务已进入 {status}。请读取 {summary_file} 和 {task_log}，基于真实结果自行继续原任务；不要重新启动该任务。'
-```
-
-完整示例：
-
-```bash
-python3 "$MONITOR" launch \
-  --project "demo-project" \
-  --summary "全量评测" \
-  --cwd "/absolute/path/to/demo-project" \
-  --timeout-minutes 240 \
-  --resume-origin-session \
-  --session-message '后台任务已进入 {status}。请读取 {summary_file}，自行决定下一步。' \
-  -- python3 run_eval.py
-```
-
-消息由启动任务的 Agent 决定，不由脚本写死。可用占位符：
-
-| 占位符 | 内容 |
-|---|---|
-| `{status}` | `completed`、`failed`、`timed_out` 等终态 |
-| `{project}`、`{summary}`、`{task_id}` | 任务标识 |
-| `{state_file}`、`{summary_file}`、`{task_log}` | 真实结果路径 |
-| `{exit_code}`、`{error}` | 可用时的退出码或错误 |
-| `{notification_status}` | 飞书/Lark 通知状态 |
-
-Worker 在终态时读取启动环境中的精确 `CODEX_THREAD_ID`，单次执行官方 [`codex exec resume`](https://learn.chatgpt.com/docs/developer-commands#codex-exec)：
-
-```text
-codex exec resume <原线程ID> -
-```
-
-消息经 stdin 传递，不出现在进程参数中。此路径不创建 Automation、不轮询、不使用 `--last`，也不自动重试。它会启动一个新的 Codex turn，可能产生额外模型用量。
+通知不包含命令、日志、工作目录、原始用户提示或 webhook。`failed`、`start_failed`、`monitor_failed` 和 `timed_out` 不发送“完成”；`completed_notification_failed` 表示任务成功但消息未送达，可以执行 `retry-notification`。
 
 ## 状态与故障排查
 
