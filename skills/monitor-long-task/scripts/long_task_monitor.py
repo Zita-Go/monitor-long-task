@@ -5,22 +5,26 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import hashlib
 import json
 import os
 import re
 import secrets
+import shutil
 import stat
+import string
 import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 VERSION = 1
 
 
@@ -35,6 +39,20 @@ DEFAULT_WEBHOOK_FILE = DEFAULT_CODEX_HOME / "secrets" / "feishu-long-task-webhoo
 FEISHU_WEBHOOK_PREFIXES = (
     "https://open.feishu.cn/open-apis/bot/v2/hook/",
     "https://open.larksuite.com/open-apis/bot/v2/hook/",
+)
+SESSION_MESSAGE_FIELDS = frozenset(
+    {
+        "error",
+        "exit_code",
+        "notification_status",
+        "project",
+        "state_file",
+        "status",
+        "summary",
+        "summary_file",
+        "task_id",
+        "task_log",
+    }
 )
 
 
@@ -94,6 +112,31 @@ def normalize_summary(value: str) -> str:
     if len(summary) > 80:
         summary = summary[:79].rstrip() + "…"
     return summary
+
+
+def normalize_thread_id(value: str) -> str:
+    candidate = value.strip()
+    if not candidate:
+        raise ValueError("origin thread id is required")
+    try:
+        return str(uuid.UUID(candidate))
+    except ValueError as exc:
+        raise ValueError("origin thread id must be a UUID") from exc
+
+
+def validate_session_message_template(value: str) -> str:
+    template = value.strip()
+    if not template:
+        raise ValueError("session message is required when origin-session resume is enabled")
+    for _literal, field_name, format_spec, conversion in string.Formatter().parse(template):
+        if field_name is None:
+            continue
+        if field_name not in SESSION_MESSAGE_FIELDS:
+            allowed = ", ".join(sorted(SESSION_MESSAGE_FIELDS))
+            raise ValueError(f"unknown session message field {field_name!r}; allowed: {allowed}")
+        if format_spec or conversion:
+            raise ValueError("session message fields do not support format specs or conversions")
+    return template
 
 
 def infer_project(cwd: Path) -> str:
@@ -199,6 +242,7 @@ def task_paths(task_dir: Path) -> dict[str, str]:
         "summary_file": str(task_dir / "summary.json"),
         "task_log": str(task_dir / "task.log"),
         "monitor_log": str(task_dir / "monitor.log"),
+        "session_resume_log": str(task_dir / "session-resume.log"),
     }
 
 
@@ -207,6 +251,88 @@ def write_state(task_dir: Path, state: dict[str, Any], terminal: bool = False) -
     atomic_write_json(task_dir / "state.json", state)
     if terminal:
         atomic_write_json(task_dir / "summary.json", state)
+
+
+def render_session_message(request: dict[str, Any], state: dict[str, Any]) -> str:
+    config = request["origin_session_resume"]
+    notification = state.get("notification")
+    notification_status = notification.get("status", "not_sent") if isinstance(notification, dict) else "not_sent"
+    values = {
+        "error": state.get("error", ""),
+        "exit_code": state.get("exit_code", ""),
+        "notification_status": notification_status,
+        "project": request["project"],
+        "state_file": state["state_file"],
+        "status": state["status"],
+        "summary": request["summary"],
+        "summary_file": state["summary_file"],
+        "task_id": request["task_id"],
+        "task_log": state["task_log"],
+    }
+    return config["message_template"].format_map(values).strip()
+
+
+def dispatch_origin_session(
+    task_dir: Path,
+    request: dict[str, Any],
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    config = request["origin_session_resume"]
+    message = render_session_message(request, state)
+    log_path = task_dir / "session-resume.log"
+    try:
+        with log_path.open("ab", buffering=0) as log_handle:
+            os.chmod(log_path, 0o600)
+            process = subprocess.Popen(
+                [
+                    config["codex_binary"],
+                    "exec",
+                    "resume",
+                    config["thread_id"],
+                    "-",
+                ],
+                cwd=request["cwd"],
+                stdin=subprocess.PIPE,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                text=True,
+                start_new_session=True,
+                close_fds=True,
+            )
+            if process.stdin is None:
+                raise RuntimeError("codex resume process did not expose stdin")
+            process.stdin.write(message + "\n")
+            process.stdin.close()
+        return {
+            "status": "dispatched",
+            "method": "codex-exec-resume",
+            "thread_id": config["thread_id"],
+            "pid": process.pid,
+            "dispatched_at": utc_now(),
+            "message_sha256": hashlib.sha256(message.encode("utf-8")).hexdigest(),
+            "log": str(log_path),
+        }
+    except Exception as exc:
+        return {
+            "status": "failed",
+            "method": "codex-exec-resume",
+            "thread_id": config["thread_id"],
+            "failed_at": utc_now(),
+            "error": one_line(str(exc))[:500],
+            "log": str(log_path),
+        }
+
+
+def finalize_terminal_state(
+    task_dir: Path,
+    request: dict[str, Any],
+    state: dict[str, Any],
+) -> None:
+    write_state(task_dir, state, terminal=True)
+    if "origin_session_resume" not in request or "origin_session_resume" in state:
+        return
+    state["origin_session_resume"] = dispatch_origin_session(task_dir, request, state)
+    write_state(task_dir, state, terminal=True)
 
 
 def initial_state(task_dir: Path, request: dict[str, Any], status: str) -> dict[str, Any]:
@@ -244,7 +370,7 @@ def complete_and_notify(
         }
     state["notification"] = notification
     state["status"] = "completed" if notification["status"] == "sent" else "completed_notification_failed"
-    write_state(task_dir, state, terminal=True)
+    finalize_terminal_state(task_dir, request, state)
 
 
 def run_managed_command(task_dir: Path, request: dict[str, Any]) -> int:
@@ -274,7 +400,7 @@ def run_managed_command(task_dir: Path, request: dict[str, Any]) -> int:
                         "task_process_left_running": process.poll() is None,
                     }
                 )
-                write_state(task_dir, state, terminal=True)
+                finalize_terminal_state(task_dir, request, state)
                 return 0
     except (OSError, ValueError) as exc:
         state.update(
@@ -284,13 +410,13 @@ def run_managed_command(task_dir: Path, request: dict[str, Any]) -> int:
                 "error": one_line(str(exc))[:500],
             }
         )
-        write_state(task_dir, state, terminal=True)
+        finalize_terminal_state(task_dir, request, state)
         return 1
 
     state["exit_code"] = exit_code
     if exit_code != 0:
         state.update({"status": "failed", "finished_at": utc_now()})
-        write_state(task_dir, state, terminal=True)
+        finalize_terminal_state(task_dir, request, state)
         return exit_code
 
     complete_and_notify(task_dir, request, state)
@@ -316,7 +442,7 @@ def watch_completion(task_dir: Path, request: dict[str, Any]) -> int:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             state.update({"status": "timed_out", "finished_at": utc_now()})
-            write_state(task_dir, state, terminal=True)
+            finalize_terminal_state(task_dir, request, state)
             return 0
 
         state["checks"] += 1
@@ -348,7 +474,7 @@ def watch_completion(task_dir: Path, request: dict[str, Any]) -> int:
                     "error": one_line(str(exc))[:500],
                 }
             )
-            write_state(task_dir, state, terminal=True)
+            finalize_terminal_state(task_dir, request, state)
             return 1
 
         time.sleep(min(request["interval_seconds"], max(0, deadline - time.monotonic())))
@@ -356,6 +482,7 @@ def watch_completion(task_dir: Path, request: dict[str, Any]) -> int:
 
 def run_worker(task_dir: Path) -> int:
     request_path = task_dir / "request.json"
+    request: dict[str, Any] | None = None
     try:
         request = read_json(request_path)
         if request["mode"] == "launch":
@@ -372,7 +499,12 @@ def run_worker(task_dir: Path) -> int:
             "error": one_line(str(exc))[:500],
             **task_paths(task_dir),
         }
-        write_state(task_dir, fallback, terminal=True)
+        if request is None:
+            write_state(task_dir, fallback, terminal=True)
+        else:
+            fallback.setdefault("project", request.get("project", ""))
+            fallback.setdefault("summary", request.get("summary", ""))
+            finalize_terminal_state(task_dir, request, fallback)
         return 1
 
 
@@ -383,6 +515,33 @@ def command_from_remainder(values: list[str]) -> list[str]:
     if not command:
         raise ValueError("a command is required after --")
     return command
+
+
+def resolve_codex_binary(value: str) -> str:
+    candidate = value.strip()
+    if not candidate:
+        raise ValueError("codex binary is required for origin-session resume")
+    if os.sep in candidate:
+        resolved = Path(candidate).expanduser().resolve()
+        if not resolved.is_file() or not os.access(resolved, os.X_OK):
+            raise ValueError(f"codex binary is not executable: {resolved}")
+        return str(resolved)
+    resolved_command = shutil.which(candidate)
+    if not resolved_command:
+        raise ValueError(f"codex binary was not found on PATH: {candidate}")
+    return resolved_command
+
+
+def build_origin_session_resume(args: argparse.Namespace) -> dict[str, str] | None:
+    if not args.resume_origin_session:
+        if args.session_message:
+            raise ValueError("--session-message requires --resume-origin-session")
+        return None
+    return {
+        "thread_id": normalize_thread_id(args.origin_thread_id),
+        "message_template": validate_session_message_template(args.session_message or ""),
+        "codex_binary": resolve_codex_binary(args.codex_binary),
+    }
 
 
 def create_task(args: argparse.Namespace, mode: str) -> int:
@@ -397,6 +556,7 @@ def create_task(args: argparse.Namespace, mode: str) -> int:
     if timeout_seconds < 60:
         raise ValueError("timeout must be at least one minute")
     command = command_from_remainder(args.command)
+    origin_session_resume = build_origin_session_resume(args)
     project = normalize_project(args.project) if args.project else infer_project(cwd)
     summary = normalize_summary(args.summary)
     task_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ-") + secrets.token_hex(4)
@@ -414,6 +574,8 @@ def create_task(args: argparse.Namespace, mode: str) -> int:
         "command": command,
         "webhook_file": str(webhook_file),
     }
+    if origin_session_resume is not None:
+        request["origin_session_resume"] = origin_session_resume
     if mode == "watch":
         if args.interval_seconds < 1:
             raise ValueError("interval must be at least one second")
@@ -525,6 +687,25 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--timeout-minutes", type=float, default=1440, help="monitor timeout; default: 1440")
     parser.add_argument("--state-dir", default=str(DEFAULT_STATE_DIR), help="private task state directory")
     parser.add_argument("--webhook-file", default=str(DEFAULT_WEBHOOK_FILE), help="0600 file containing webhook URL")
+    parser.add_argument(
+        "--resume-origin-session",
+        action="store_true",
+        help="dispatch one codex exec resume event to the exact origin thread at terminal state",
+    )
+    parser.add_argument(
+        "--origin-thread-id",
+        default=os.environ.get("CODEX_THREAD_ID", ""),
+        help="origin Codex thread UUID; defaults to CODEX_THREAD_ID",
+    )
+    parser.add_argument(
+        "--session-message",
+        help="agent-authored resume message template; required with --resume-origin-session",
+    )
+    parser.add_argument(
+        "--codex-binary",
+        default="codex",
+        help="Codex executable used for the one-shot resume event",
+    )
     parser.add_argument("command", nargs=argparse.REMAINDER, help="command and arguments after --")
 
 

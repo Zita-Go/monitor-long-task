@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 
@@ -50,6 +51,25 @@ class FakeOpener:
         self.request = request
         self.timeout = timeout
         return FakeResponse()
+
+
+class FakeStdin:
+    def __init__(self) -> None:
+        self.value = ""
+        self.closed = False
+
+    def write(self, value: str) -> int:
+        self.value += value
+        return len(value)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class FakeProcess:
+    def __init__(self, pid: int = 4242) -> None:
+        self.pid = pid
+        self.stdin = FakeStdin()
 
 
 class LongTaskMonitorTests(unittest.TestCase):
@@ -211,6 +231,121 @@ class LongTaskMonitorTests(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertEqual(configured.read_text().strip(), FAKE_WEBHOOK)
         self.assertEqual(stat.S_IMODE(configured.stat().st_mode), 0o600)
+
+    def test_origin_session_resume_requires_exact_thread_and_agent_message(self) -> None:
+        thread_id = "01a042ae-2b44-7a00-9d98-60cb16f9e5d4"
+        arguments = SimpleNamespace(
+            resume_origin_session=True,
+            origin_thread_id=thread_id,
+            session_message="任务进入 {status}，请读取 {summary_file} 后自行继续。",
+            codex_binary=sys.executable,
+        )
+        config = monitor.build_origin_session_resume(arguments)
+        self.assertEqual(config["thread_id"], thread_id)
+        self.assertEqual(config["codex_binary"], str(Path(sys.executable).resolve()))
+
+        arguments.origin_thread_id = "not-a-thread-id"
+        with self.assertRaisesRegex(ValueError, "must be a UUID"):
+            monitor.build_origin_session_resume(arguments)
+
+        arguments.origin_thread_id = thread_id
+        arguments.session_message = "未知字段 {unknown}"
+        with self.assertRaisesRegex(ValueError, "unknown session message field"):
+            monitor.build_origin_session_resume(arguments)
+
+    def test_origin_session_resume_dispatches_once_without_polling(self) -> None:
+        task_dir = self.root / "origin-session"
+        task_dir.mkdir()
+        thread_id = "01a042ae-2b44-7a00-9d98-60cb16f9e5d4"
+        request = self.request("origin-session", "launch", [sys.executable, "-c", "pass"])
+        request["origin_session_resume"] = {
+            "thread_id": thread_id,
+            "message_template": (
+                "任务 {task_id} 已进入 {status}。请读取 {summary_file}，"
+                "由你基于真实结果决定下一步。"
+            ),
+            "codex_binary": sys.executable,
+        }
+        state = monitor.initial_state(task_dir, request, "completed")
+        state["finished_at"] = monitor.utc_now()
+        fake_process = FakeProcess()
+
+        with mock.patch.object(monitor.subprocess, "Popen", return_value=fake_process) as popen:
+            monitor.finalize_terminal_state(task_dir, request, state)
+            monitor.finalize_terminal_state(task_dir, request, state)
+
+        popen.assert_called_once()
+        positional, keyword = popen.call_args
+        self.assertEqual(
+            positional[0],
+            [sys.executable, "exec", "resume", thread_id, "-"],
+        )
+        self.assertTrue(keyword["start_new_session"])
+        self.assertEqual(keyword["cwd"], str(self.root))
+        self.assertEqual(
+            fake_process.stdin.value,
+            (
+                "任务 origin-session 已进入 completed。"
+                f"请读取 {task_dir / 'summary.json'}，由你基于真实结果决定下一步。\n"
+            ),
+        )
+        self.assertTrue(fake_process.stdin.closed)
+        final_state = json.loads((task_dir / "summary.json").read_text())
+        resume = final_state["origin_session_resume"]
+        self.assertEqual(resume["status"], "dispatched")
+        self.assertEqual(resume["thread_id"], thread_id)
+        self.assertEqual(resume["pid"], 4242)
+        self.assertEqual(stat.S_IMODE((task_dir / "session-resume.log").stat().st_mode), 0o600)
+
+    def test_origin_session_resume_passes_agent_message_over_stdin(self) -> None:
+        task_dir = self.root / "origin-session-subprocess"
+        task_dir.mkdir()
+        record_path = self.root / "resume-record.json"
+        fake_codex = self.root / "fake-codex"
+        fake_codex.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, os, pathlib, sys\n"
+            "pathlib.Path(os.environ['FAKE_CODEX_RECORD']).write_text(\n"
+            "    json.dumps({'argv': sys.argv[1:], 'stdin': sys.stdin.read()}),\n"
+            "    encoding='utf-8',\n"
+            ")\n",
+            encoding="utf-8",
+        )
+        fake_codex.chmod(0o700)
+        thread_id = "01a042ae-2b44-7a00-9d98-60cb16f9e5d4"
+        request = self.request(
+            "origin-session-subprocess",
+            "launch",
+            [sys.executable, "-c", "pass"],
+        )
+        request["origin_session_resume"] = {
+            "thread_id": thread_id,
+            "message_template": "由 Agent 决定的消息：{status} / {summary_file}",
+            "codex_binary": str(fake_codex),
+        }
+        state = monitor.initial_state(task_dir, request, "failed")
+        state["exit_code"] = 9
+        expected_message = monitor.render_session_message(request, state) + "\n"
+        real_popen = subprocess.Popen
+        processes: list[subprocess.Popen[str]] = []
+
+        def retained_popen(*args: object, **kwargs: object) -> subprocess.Popen[str]:
+            process = real_popen(*args, **kwargs)
+            processes.append(process)
+            return process
+
+        with (
+            mock.patch.dict(os.environ, {"FAKE_CODEX_RECORD": str(record_path)}),
+            mock.patch.object(monitor.subprocess, "Popen", side_effect=retained_popen),
+        ):
+            result = monitor.dispatch_origin_session(task_dir, request, state)
+            return_code = processes[0].wait(timeout=5)
+
+        self.assertEqual(processes[0].pid, result["pid"])
+        self.assertEqual(return_code, 0)
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        self.assertEqual(record["argv"], ["exec", "resume", thread_id, "-"])
+        self.assertEqual(record["stdin"], expected_message)
 
     def test_public_skill_metadata_is_portable(self) -> None:
         skill_text = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")

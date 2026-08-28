@@ -12,6 +12,7 @@ A Codex skill that supervises detached long-running commands or explicit complet
 - 将 `state.json`、终态 `summary.json` 和任务日志写入私有状态目录。
 - 区分任务失败、监控超时和通知失败。
 - 成功消息采用固定、简洁且不泄露日志的文本格式，详见[通知内容](#通知内容)。
+- 可选地在终态事件发生时单次续接精确的原 Codex 会话，不使用轮询。
 - 仅使用 Python 标准库，无第三方运行时依赖。
 
 ## 要求
@@ -43,7 +44,7 @@ bash scripts/install.sh
 4. 配置安全设置：
    - 最简单：启用关键词校验并填写 `完成`，本项目的所有成功消息都包含这个词；
    - 有固定公网出口时：也可以使用 IP 白名单；
-   - `v0.1.x` 尚未生成签名参数，因此不要启用“签名校验”，否则飞书会拒绝消息。
+   - 当前版本尚未生成签名参数，因此不要启用“签名校验”，否则飞书会拒绝消息。
 5. 完成创建并复制形如以下格式的 webhook 地址：
 
 ```text
@@ -138,6 +139,42 @@ python3 "$MONITOR" launch \
 ```
 
 通知中不会包含命令、日志、工作目录、用户原始提示或 webhook。`failed`、`start_failed`、`monitor_failed` 和 `timed_out` 不发送“完成”消息；`completed_notification_failed` 表示任务已经成功，但消息未送达，可使用 `retry-notification` 重发同一条消息。
+
+## 事件驱动续接原 Codex 会话
+
+如果希望任务结束后让启动它的 Codex 会话继续处理结果，可以显式启用一次性续接：
+
+```bash
+python3 "$MONITOR" launch \
+  --project "demo-project" \
+  --summary "全量评测" \
+  --cwd "/absolute/path/to/demo-project" \
+  --timeout-minutes 240 \
+  --resume-origin-session \
+  --session-message '后台任务已进入 {status}。请读取 {summary_file} 和 {task_log}，基于真实结果自行继续原任务；不要重新启动该任务。' \
+  -- python3 run_eval.py
+```
+
+这条消息不是脚本写死的。启动监控的 Agent 应根据任务自行决定 `--session-message`，并可引用以下字段：
+
+| 占位符 | 内容 |
+|---|---|
+| `{status}` | 最终状态，例如 `completed`、`failed` 或 `timed_out` |
+| `{project}`、`{summary}` | 启动时的项目名和结果短语 |
+| `{task_id}` | 监控任务 ID |
+| `{state_file}`、`{summary_file}`、`{task_log}` | 真实状态、终态摘要和任务日志路径 |
+| `{exit_code}`、`{error}` | 可用时的退出码或监控错误 |
+| `{notification_status}` | 飞书/Lark 通知状态 |
+
+实现是事件驱动的：worker 在任务进入终态时，从启动环境捕获的精确 `CODEX_THREAD_ID` 调用官方文档中的 [`codex exec resume`](https://learn.chatgpt.com/docs/developer-commands#codex-exec)，并且只执行一次：
+
+```text
+codex exec resume <原线程ID> -
+```
+
+Agent 编写的消息通过标准输入传递，不出现在进程参数中。该路径不会创建 Automation、定时任务或轮询，也绝不使用 `--last`。无论成功、失败还是超时，每个监控任务最多派发一次；派发信息记录在 `origin_session_resume` 字段，续接进程的后续输出写入私有 `session-resume.log`。
+
+注意：续接会启动一个新的 Codex turn，可能产生额外模型用量。`origin_session_resume.status=dispatched` 只证明续接进程已经启动，不等于该 turn 最终成功；原会话仍处于活动 turn 等后续错误应查看 `session-resume.log`。缺少 `CODEX_THREAD_ID`、找不到 `codex` 命令或进程无法启动时记录为 `failed`。任何续接问题都不会影响已经落盘的任务状态或飞书通知，也不会循环重试。
 
 ## 使用
 

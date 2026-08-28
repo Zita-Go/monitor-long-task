@@ -1,6 +1,6 @@
 ---
 name: monitor-long-task
-description: Run and monitor detached long-running commands or explicit completion checks, persist structured state, and send a Feishu/Lark webhook only after verified success. Use for builds, tests, experiments, imports, downloads, migrations, batch jobs, or external convergence expected to take at least 10 minutes or continue beyond the current Codex turn; do not use for ordinary short commands.
+description: Run and monitor detached long-running commands or explicit completion checks, persist structured state, send a Feishu/Lark webhook after verified success, and optionally resume the exact originating Codex session once at terminal state. Use for builds, tests, experiments, imports, downloads, migrations, batch jobs, or external convergence expected to take at least 10 minutes or continue beyond the current Codex turn; do not use for ordinary short commands.
 ---
 
 # 长任务完成监控
@@ -27,6 +27,23 @@ python3 "$MONITOR" configure
 - 本地前台命令：使用 `launch`，让监控器托管命令。不要先单独启动同一命令。
 - 外部任务或会自行 daemonize 的命令：先确定幂等、只读的完成检查，再使用 `watch`。启动任务前确认检查当前返回非 0，启动任务后立即启动监控。
 - 预计不足 10 分钟的普通命令：直接执行，不启动监控。
+
+## 可选：结束后唤醒原会话
+
+只有用户要求任务结束后返回原 Codex 会话时，才启用 `--resume-origin-session`。这是终态事件触发的一次性续接，不要创建 Automation、定时任务或任何会话轮询。
+
+1. 确认环境中存在精确的 `CODEX_THREAD_ID`，不要使用 `--last`。
+2. 根据当前任务上下文自行编写 `--session-message`；脚本不固定消息内容。
+3. 消息应让恢复后的 Agent 读取真实状态并决定下一步，避免预先声称成功。可使用 `{status}`、`{summary_file}`、`{task_log}`、`{exit_code}`、`{error}` 等占位符。
+
+示例参数：
+
+```bash
+--resume-origin-session \
+--session-message '后台任务已进入 {status}。请读取 {summary_file} 和 {task_log}，基于真实结果自行继续原任务；不要重新启动该任务。'
+```
+
+任务进入任一终态时，worker 仅执行一次 `codex exec resume "$CODEX_THREAD_ID" -`，从标准输入发送 Agent 编写的消息。该操作会产生一个新的 Codex turn；若续接启动失败，只记录 `origin_session_resume.status=failed`，不循环重试。
 
 ## 启动托管命令
 
@@ -76,6 +93,7 @@ python3 "$MONITOR" status <task_id>
 - `completed_notification_failed`：任务成功但通知失败；使用 `retry-notification <task_id>` 重试，不能说通知已发送。
 - `failed`、`start_failed`、`monitor_failed`：任务未完成，不发送“完成”消息。
 - `timed_out`：监控超时；托管任务不会被自动终止。检查真实进程状态后再决定是否继续监控或终止。
+- `origin_session_resume.status=dispatched`：已启动一次精确原会话续接；后续 CLI 结果查看 `session-resume.log`。`failed` 表示续接进程未能启动，不进行轮询或自动重试。
 - 状态、终态摘要和日志默认保存在 `${CODEX_HOME:-$HOME/.codex}/long-task-monitors/<task_id>/`。
 
 不要读取、打印或提交 webhook 密钥文件。脚本仅接受官方 Feishu/Lark 机器人 URL，并要求密钥文件权限不宽于 `0600`。
