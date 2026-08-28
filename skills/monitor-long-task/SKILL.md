@@ -1,6 +1,6 @@
 ---
 name: monitor-long-task
-description: Run and monitor detached long-running commands or explicit completion checks, persist structured state, send a Feishu/Lark webhook after verified success, and optionally resume the exact originating Codex session once at terminal state. Use for builds, tests, experiments, imports, downloads, migrations, batch jobs, or external convergence expected to take at least 10 minutes or continue beyond the current Codex turn; do not use for ordinary short commands.
+description: Run and monitor detached long-running commands or explicit completion checks, persist structured state, send a Feishu/Lark webhook after verified success, and resume the exact originating Codex session once at terminal state by default when its thread ID is available. Use for builds, tests, experiments, imports, downloads, migrations, batch jobs, or external convergence expected to take at least 10 minutes or continue beyond the current Codex turn; do not use for ordinary short commands.
 ---
 
 # 长任务完成监控
@@ -28,11 +28,11 @@ python3 "$MONITOR" configure
 - 外部任务或会自行 daemonize 的命令：先确定幂等、只读的完成检查，再使用 `watch`。启动任务前确认检查当前返回非 0，启动任务后立即启动监控。
 - 预计不足 10 分钟的普通命令：直接执行，不启动监控。
 
-## 可选：结束后唤醒原会话
+## 默认：结束后唤醒原会话
 
-只有用户要求任务结束后返回原 Codex 会话时，才启用 `--resume-origin-session`。这是终态事件触发的一次性续接，不要创建 Automation、定时任务或任何会话轮询。
+从 Codex 会话启动长任务且环境中存在精确 `CODEX_THREAD_ID` 时，默认启用 `--resume-origin-session`。只有用户明确要求“只发飞书”“不要回原会话”或同等意图时才关闭。这是终态事件触发的一次性续接，不要创建 Automation、定时任务或任何会话轮询。
 
-1. 确认环境中存在精确的 `CODEX_THREAD_ID`，不要使用 `--last`。
+1. 确认环境中存在精确的 `CODEX_THREAD_ID`，不要使用 `--last`。缺少线程 ID 时继续执行任务但不启用续接，并向用户如实说明。
 2. 根据当前任务上下文自行编写 `--session-message`；脚本不固定消息内容。
 3. 消息应让恢复后的 Agent 读取真实状态并决定下一步，避免预先声称成功。可使用 `{status}`、`{summary_file}`、`{task_log}`、`{exit_code}`、`{error}` 等占位符。
 

@@ -7,7 +7,7 @@
 
 A Codex skill for detached long-running tasks, verified Feishu/Lark notifications, and event-driven continuation in the exact originating Codex session.
 
-这是一个面向 Codex 的长任务 Skill：安装并配置一次后，用户只需正常描述任务。Agent 会选择监控方式、启动后台任务，并在真实终态发生时发送飞书/Lark；需要时还可以无轮询地续接启动任务的原 Codex 会话。
+这是一个面向 Codex 的长任务 Skill：安装并配置一次后，用户只需正常描述任务。Agent 会选择监控方式、启动后台任务，并在真实终态发生时发送飞书/Lark；存在精确原线程 ID 时，默认无轮询地续接启动任务的原 Codex 会话。
 
 ## 目录
 
@@ -48,16 +48,16 @@ python3 "$MONITOR" configure
 
 ### 3. 使用自然语言发起任务
 
-只需要完成通知：
+默认行为：飞书通知并返回原会话继续处理：
 
 ```text
-帮我跑完整评测，这是长任务，结束后飞书通知我。
+帮我跑完整评测，这是长任务，结束后通知我。
 ```
 
-任务结束后还要回到当前会话继续处理：
+只需要飞书、不返回原会话：
 
 ```text
-启动训练；任务结束后回到当前会话，读取最终产物并继续汇总。
+启动训练；结束后只发飞书，不要回原会话。
 ```
 
 等待外部系统产生结果：
@@ -66,7 +66,7 @@ python3 "$MONITOR" configure
 启动导入任务并等待最终产物出现，完成后飞书通知我。
 ```
 
-Agent 会自行决定项目名、摘要、超时时间、使用 `launch` 还是 `watch`，以及是否启用原会话续接。若任务意图不明显，也可以显式提到 `$monitor-long-task`。
+Agent 会自行决定项目名、摘要、超时时间以及使用 `launch` 还是 `watch`。原会话续接默认开启；用户明确要求不返回时才关闭。若任务意图不明显，也可以显式提到 `$monitor-long-task`。
 
 成功时飞书/Lark 收到：
 
@@ -82,7 +82,7 @@ Agent 会自行决定项目名、摘要、超时时间、使用 `launch` 还是 
 
 ## 事件驱动续接原 Codex 会话
 
-当用户要求“任务结束后回到原会话继续处理”时，Agent 会启用 `--resume-origin-session` 并根据任务上下文自行编写续接消息。任务进入成功、失败或超时等终态后，worker 使用启动时捕获的精确 `CODEX_THREAD_ID`，单次调用官方 [`codex exec resume`](https://learn.chatgpt.com/docs/developer-commands#codex-exec)：
+当长任务从 Codex 会话启动且存在精确 `CODEX_THREAD_ID` 时，Agent 默认启用 `--resume-origin-session`，并根据任务上下文自行编写续接消息。用户明确要求“只发飞书”或“不要回原会话”时才关闭。任务进入成功、失败或超时等终态后，worker 单次调用官方 [`codex exec resume`](https://learn.chatgpt.com/docs/developer-commands#codex-exec)：
 
 ```text
 codex exec resume <原线程ID> -
@@ -106,7 +106,7 @@ codex exec resume <原线程ID> -
 --session-message '后台任务已进入 {status}。请读取 {summary_file} 和 {task_log}，基于真实结果自行继续原任务；不要重新启动该任务。'
 ```
 
-续接会产生一个额外 Codex turn，因此默认关闭。只有用户表达“回到原会话继续处理”的意图时，Agent 才应启用。
+续接会产生一个额外 Codex turn。该默认行为由 Skill 的 Agent 决策规则实现；脱离 Agent 直接调用底层 CLI 时，仍需显式传入 `--resume-origin-session`。缺少精确线程 ID 时，Agent 不启用续接，也绝不回退到 `--last`。
 
 ## Agent 如何工作
 
@@ -126,14 +126,15 @@ flowchart LR
 |---|---|---|
 | 托管本地构建、测试或训练命令 | 使用 `launch` 等待进程退出 | 否 |
 | 等待外部任务、明确标记或最终产物 | 使用 `watch` 检查完成条件 | 是，只检查显式外部条件 |
-| 只要求完成后通知 | 不启用原会话续接 | 不涉及 |
+| 一般长任务 | 默认启用 `--resume-origin-session` | 否，终态时单次派发 |
+| 明确只发飞书、不要回原会话 | 不启用原会话续接 | 不涉及 |
 | 要求结束后继续分析或汇总 | 启用 `--resume-origin-session` | 否，终态时单次派发 |
 | 普通短命令 | 不使用该 Skill | 不涉及 |
 
 默认行为：
 
 - 飞书/Lark 只在验证成功后发送；失败和超时不伪装成“完成”。
-- 原会话续接默认关闭，避免未经请求的额外 Codex turn。
+- 存在精确 `CODEX_THREAD_ID` 时，原会话续接默认开启；用户明确要求不返回时关闭。
 - 原会话续接本身从不轮询；`watch` 只服务于无法直接托管的外部条件。
 - 超时不会自动杀死仍在运行的真实任务。
 

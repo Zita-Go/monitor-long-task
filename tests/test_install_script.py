@@ -49,7 +49,16 @@ class InstallScriptTests(unittest.TestCase):
             capture_output=True,
             check=True,
         )
-        self.assertIn("0.2.1", version.stdout)
+        source_monitor = (
+            REPOSITORY_ROOT / "skills" / "monitor-long-task" / "scripts" / "long_task_monitor.py"
+        )
+        source_version = subprocess.run(
+            ["python3", str(source_monitor), "--version"],
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        self.assertEqual(version.stdout, source_version.stdout)
 
         duplicate = self.run_installer()
         self.assertEqual(duplicate.returncode, 2)
