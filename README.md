@@ -9,12 +9,10 @@ A Codex skill for detached long-running tasks, verified Feishu/Lark notification
 
 这是一个面向 Codex 的长任务 Skill：安装并配置一次后，用户只需正常描述任务。Agent 会选择监控方式、启动后台任务，并在真实终态发生时发送飞书/Lark；需要时还可以无轮询地续接启动任务的原 Codex 会话。
 
-> **正常使用不需要手动运行 `long_task_monitor.py`、`launch` 或 `watch`。** 这些命令是 Agent 的实现细节，只在集成开发和故障排查时需要。
-
 ## 目录
 
-- [普通用户：三步开始](#普通用户三步开始)
-- [重点：事件驱动续接原 Codex 会话](#重点事件驱动续接原-codex-会话)
+- [快速开始](#快速开始)
+- [事件驱动续接原 Codex 会话](#事件驱动续接原-codex-会话)
 - [Agent 如何工作](#agent-如何工作)
 - [安装、更新与卸载](#安装更新与卸载)
 - [创建 webhook](#创建-webhook)
@@ -23,7 +21,7 @@ A Codex skill for detached long-running tasks, verified Feishu/Lark notification
 - [状态与故障排查](#状态与故障排查)
 - [安全边界](#安全边界)
 
-## 普通用户：三步开始
+## 快速开始
 
 ### 1. 安装 Skill
 
@@ -48,7 +46,7 @@ python3 "$MONITOR" configure
 
 没有 webhook 时，先看[创建 webhook](#创建-webhook)。
 
-### 3. 以后只需正常告诉 Agent
+### 3. 使用自然语言发起任务
 
 只需要完成通知：
 
@@ -82,9 +80,7 @@ Agent 会自行决定项目名、摘要、超时时间、使用 `launch` 还是 
 【demo-project】：完成TB2.1 全量评测
 ```
 
-## 重点：事件驱动续接原 Codex 会话
-
-这是本项目区别于普通通知脚本的核心能力。
+## 事件驱动续接原 Codex 会话
 
 当用户要求“任务结束后回到原会话继续处理”时，Agent 会启用 `--resume-origin-session` 并根据任务上下文自行编写续接消息。任务进入成功、失败或超时等终态后，worker 使用启动时捕获的精确 `CODEX_THREAD_ID`，单次调用官方 [`codex exec resume`](https://learn.chatgpt.com/docs/developer-commands#codex-exec)：
 
