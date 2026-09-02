@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Run or observe a detached long task and notify Feishu after real success."""
+"""Monitor a detached long task, notify Feishu, and resume its origin session safely."""
 
 from __future__ import annotations
 
 import argparse
+import base64
 import getpass
 import hashlib
 import json
@@ -11,20 +12,24 @@ import os
 import re
 import secrets
 import shutil
+import socket
 import stat
 import string
+import struct
 import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
 import uuid
+from collections import deque
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 VERSION = 1
 
 
@@ -36,6 +41,10 @@ def default_codex_home() -> Path:
 DEFAULT_CODEX_HOME = default_codex_home()
 DEFAULT_STATE_DIR = DEFAULT_CODEX_HOME / "long-task-monitors"
 DEFAULT_WEBHOOK_FILE = DEFAULT_CODEX_HOME / "secrets" / "feishu-long-task-webhook"
+DEFAULT_APP_SERVER_SOCKET = DEFAULT_CODEX_HOME / "app-server-control" / "app-server-control.sock"
+APP_SERVER_MAX_HEADER_BYTES = 64 * 1024
+APP_SERVER_MAX_MESSAGE_BYTES = 16 * 1024 * 1024
+APP_SERVER_RECONNECT_DELAYS = (1, 2, 5, 10, 30, 60)
 FEISHU_WEBHOOK_PREFIXES = (
     "https://open.feishu.cn/open-apis/bot/v2/hook/",
     "https://open.larksuite.com/open-apis/bot/v2/hook/",
@@ -95,6 +104,556 @@ def read_json(path: Path) -> dict[str, Any]:
 
 def one_line(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip()
+
+
+class AppServerTransportError(RuntimeError):
+    """The managed App Server connection was lost or could not be opened."""
+
+
+class AppServerProtocolError(RuntimeError):
+    """The managed App Server sent an invalid or unsupported response."""
+
+
+class AppServerRequestError(AppServerProtocolError):
+    """The managed App Server rejected a JSON-RPC request."""
+
+    def __init__(self, method: str, error: dict[str, Any]) -> None:
+        self.method = method
+        self.code = error.get("code")
+        self.message = str(error.get("message", "request failed"))
+        super().__init__(f"{method} failed ({self.code}): {self.message}")
+
+
+class OriginSessionIdleTimeout(RuntimeError):
+    """The origin thread did not become idle before its delivery deadline."""
+
+
+class OriginQueueOutcomeUnknown(RuntimeError):
+    """A queue mutation may have succeeded, so retrying could duplicate it."""
+
+
+class UnixWebSocketConnection:
+    """Minimal RFC 6455 client for a local App Server Unix socket."""
+
+    _GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+    def __init__(self, path: Path, timeout_seconds: float) -> None:
+        self.path = path
+        self.timeout_seconds = timeout_seconds
+        self.socket: socket.socket | None = None
+        self.buffer = bytearray()
+
+    def __enter__(self) -> "UnixWebSocketConnection":
+        self.connect()
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.close()
+
+    def connect(self) -> None:
+        connection: socket.socket | None = None
+        try:
+            connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            connection.settimeout(self.timeout_seconds)
+            connection.connect(str(self.path))
+        except (AttributeError, OSError) as exc:
+            if connection is not None:
+                connection.close()
+            raise AppServerTransportError(str(exc)) from exc
+
+        websocket_key = base64.b64encode(secrets.token_bytes(16)).decode("ascii")
+        request = (
+            "GET / HTTP/1.1\r\n"
+            "Host: localhost\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {websocket_key}\r\n"
+            "Sec-WebSocket-Version: 13\r\n"
+            "\r\n"
+        ).encode("ascii")
+        try:
+            connection.sendall(request)
+            header = self._read_http_header(connection)
+            self._validate_upgrade_response(header, websocket_key)
+        except (OSError, AppServerProtocolError, AppServerTransportError) as exc:
+            connection.close()
+            if isinstance(exc, (AppServerProtocolError, AppServerTransportError)):
+                raise
+            raise AppServerTransportError(str(exc)) from exc
+        self.socket = connection
+
+    def close(self) -> None:
+        if self.socket is not None:
+            try:
+                self.socket.close()
+            finally:
+                self.socket = None
+                self.buffer.clear()
+
+    def _read_http_header(self, connection: socket.socket) -> bytes:
+        data = bytearray()
+        while b"\r\n\r\n" not in data:
+            if len(data) >= APP_SERVER_MAX_HEADER_BYTES:
+                raise AppServerProtocolError("App Server WebSocket response header is too large")
+            chunk = connection.recv(4096)
+            if not chunk:
+                raise AppServerTransportError("App Server closed during WebSocket upgrade")
+            data.extend(chunk)
+        header, remainder = bytes(data).split(b"\r\n\r\n", 1)
+        self.buffer.extend(remainder)
+        return header
+
+    @classmethod
+    def _validate_upgrade_response(cls, header: bytes, websocket_key: str) -> None:
+        lines = header.decode("iso-8859-1").split("\r\n")
+        if not lines or not lines[0].startswith(("HTTP/1.1 101 ", "HTTP/1.0 101 ")):
+            status = lines[0] if lines else "empty response"
+            raise AppServerProtocolError(f"App Server rejected WebSocket upgrade: {status}")
+        headers: dict[str, str] = {}
+        for line in lines[1:]:
+            if ":" not in line:
+                continue
+            name, value = line.split(":", 1)
+            headers[name.strip().lower()] = value.strip()
+        if headers.get("upgrade", "").casefold() != "websocket":
+            raise AppServerProtocolError("App Server did not confirm a WebSocket upgrade")
+        connection_tokens = {
+            value.strip().casefold() for value in headers.get("connection", "").split(",")
+        }
+        if "upgrade" not in connection_tokens:
+            raise AppServerProtocolError("App Server returned an invalid WebSocket connection header")
+        expected = base64.b64encode(
+            hashlib.sha1(
+                (websocket_key + cls._GUID).encode("ascii"),
+                usedforsecurity=False,
+            ).digest()
+        ).decode("ascii")
+        if headers.get("sec-websocket-accept") != expected:
+            raise AppServerProtocolError("App Server returned an invalid WebSocket accept key")
+
+    def send_json(self, value: dict[str, Any]) -> None:
+        payload = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        self._send_frame(0x1, payload)
+
+    def receive_json(self, timeout_seconds: float) -> dict[str, Any]:
+        if self.socket is None:
+            raise AppServerTransportError("App Server WebSocket is not connected")
+        self.socket.settimeout(max(0.001, timeout_seconds))
+        fragments = bytearray()
+        message_opcode: int | None = None
+        while True:
+            finished, opcode, payload = self._receive_frame()
+            if opcode == 0x8:
+                raise AppServerTransportError("App Server closed the WebSocket")
+            if opcode == 0x9:
+                self._send_frame(0xA, payload)
+                continue
+            if opcode == 0xA:
+                continue
+            if opcode == 0x1:
+                if message_opcode is not None:
+                    raise AppServerProtocolError("received a new WebSocket message mid-fragment")
+                message_opcode = opcode
+                fragments.extend(payload)
+            elif opcode == 0x0:
+                if message_opcode is None:
+                    raise AppServerProtocolError("received an unexpected WebSocket continuation frame")
+                fragments.extend(payload)
+            else:
+                raise AppServerProtocolError(f"unsupported WebSocket opcode: {opcode}")
+            if len(fragments) > APP_SERVER_MAX_MESSAGE_BYTES:
+                raise AppServerProtocolError("App Server WebSocket message is too large")
+            if not finished:
+                continue
+            try:
+                value = json.loads(fragments.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise AppServerProtocolError("App Server sent invalid JSON") from exc
+            if not isinstance(value, dict):
+                raise AppServerProtocolError("App Server JSON-RPC message must be an object")
+            return value
+
+    def _send_frame(self, opcode: int, payload: bytes) -> None:
+        if self.socket is None:
+            raise AppServerTransportError("App Server WebSocket is not connected")
+        if len(payload) > APP_SERVER_MAX_MESSAGE_BYTES:
+            raise AppServerProtocolError("outgoing WebSocket message is too large")
+        mask = secrets.token_bytes(4)
+        first_byte = 0x80 | opcode
+        if len(payload) < 126:
+            header = bytes((first_byte, 0x80 | len(payload)))
+        elif len(payload) < 65536:
+            header = bytes((first_byte, 0x80 | 126)) + struct.pack("!H", len(payload))
+        else:
+            header = bytes((first_byte, 0x80 | 127)) + struct.pack("!Q", len(payload))
+        masked = bytes(value ^ mask[index % 4] for index, value in enumerate(payload))
+        try:
+            self.socket.sendall(header + mask + masked)
+        except OSError as exc:
+            raise AppServerTransportError(str(exc)) from exc
+
+    def _receive_frame(self) -> tuple[bool, int, bytes]:
+        first_byte, second_byte = self._receive_exact(2)
+        if first_byte & 0x70:
+            raise AppServerProtocolError("unsupported WebSocket extension bits")
+        finished = bool(first_byte & 0x80)
+        opcode = first_byte & 0x0F
+        masked = bool(second_byte & 0x80)
+        if masked:
+            raise AppServerProtocolError("server WebSocket frames must not be masked")
+        length = second_byte & 0x7F
+        if length == 126:
+            length = struct.unpack("!H", self._receive_exact(2))[0]
+        elif length == 127:
+            length = struct.unpack("!Q", self._receive_exact(8))[0]
+        if opcode >= 0x8 and (not finished or length > 125):
+            raise AppServerProtocolError("invalid WebSocket control frame")
+        if length > APP_SERVER_MAX_MESSAGE_BYTES:
+            raise AppServerProtocolError("App Server WebSocket frame is too large")
+        return finished, opcode, self._receive_exact(length)
+
+    def _receive_exact(self, length: int) -> bytes:
+        if self.socket is None:
+            raise AppServerTransportError("App Server WebSocket is not connected")
+        try:
+            while len(self.buffer) < length:
+                chunk = self.socket.recv(min(65536, length - len(self.buffer)))
+                if not chunk:
+                    raise AppServerTransportError("App Server WebSocket disconnected")
+                self.buffer.extend(chunk)
+        except TimeoutError:
+            raise
+        except OSError as exc:
+            raise AppServerTransportError(str(exc)) from exc
+        payload = bytes(self.buffer[:length])
+        del self.buffer[:length]
+        return payload
+
+
+class AppServerClient:
+    """Small JSON-RPC client used only for origin-thread status and queue APIs."""
+
+    def __init__(self, socket_path: Path, timeout_seconds: float = 15) -> None:
+        self.connection = UnixWebSocketConnection(socket_path, timeout_seconds)
+        self.timeout_seconds = timeout_seconds
+        self.next_request_id = 1
+        self.notifications: deque[dict[str, Any]] = deque()
+
+    def __enter__(self) -> "AppServerClient":
+        self.connection.connect()
+        try:
+            self._request(
+                "initialize",
+                {
+                    "clientInfo": {
+                        "name": "monitor-long-task",
+                        "title": "monitor-long-task origin-session gate",
+                        "version": __version__,
+                    },
+                    "capabilities": {
+                        "experimentalApi": True,
+                        "requestAttestation": False,
+                        "optOutNotificationMethods": [
+                            "item/agentMessage/delta",
+                            "item/commandExecution/outputDelta",
+                            "item/reasoning/summaryTextDelta",
+                            "item/reasoning/textDelta",
+                            "turn/plan/updated",
+                        ],
+                    },
+                },
+                self.timeout_seconds,
+            )
+            self.connection.send_json({"method": "initialized", "params": {}})
+        except Exception:
+            self.connection.close()
+            raise
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.connection.close()
+
+    def request(
+        self,
+        method: str,
+        params: dict[str, Any],
+        timeout_seconds: float | None = None,
+    ) -> dict[str, Any]:
+        return self._request(method, params, timeout_seconds or self.timeout_seconds)
+
+    def _request(
+        self,
+        method: str,
+        params: dict[str, Any],
+        timeout_seconds: float,
+    ) -> dict[str, Any]:
+        request_id = self.next_request_id
+        self.next_request_id += 1
+        self.connection.send_json({"id": request_id, "method": method, "params": params})
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"timed out waiting for App Server {method} response")
+            message = self.connection.receive_json(remaining)
+            if message.get("id") == request_id and "method" not in message:
+                error = message.get("error")
+                if isinstance(error, dict):
+                    raise AppServerRequestError(method, error)
+                result = message.get("result")
+                if not isinstance(result, dict):
+                    raise AppServerProtocolError(f"{method} returned a non-object result")
+                return result
+            if "method" in message and "id" not in message:
+                self.notifications.append(message)
+                continue
+            if "method" in message and "id" in message:
+                # Approval and user-input requests are also delivered to the
+                # interactive client. This observer must neither answer nor
+                # cancel them; the originating UI remains authoritative.
+                continue
+
+    def next_notification(self, timeout_seconds: float) -> dict[str, Any]:
+        if self.notifications:
+            return self.notifications.popleft()
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("timed out waiting for an App Server notification")
+            message = self.connection.receive_json(remaining)
+            if "method" in message and "id" not in message:
+                return message
+            if "method" in message and "id" in message:
+                # Leave server requests for an interactive subscriber to answer.
+                continue
+
+
+def app_server_method_unavailable(error: AppServerRequestError) -> bool:
+    message = error.message.casefold()
+    return (
+        error.code == -32601
+        or "unknown method" in message
+        or "method not found" in message
+        or (error.code == -32600 and "unknown variant" in message)
+        or "message queue is unavailable" in message
+    )
+
+
+def extract_thread_status(response: dict[str, Any]) -> str:
+    thread = response.get("thread")
+    status = thread.get("status") if isinstance(thread, dict) else None
+    status_type = status.get("type") if isinstance(status, dict) else None
+    if status_type not in {"active", "idle", "notLoaded", "systemError"}:
+        raise AppServerProtocolError("thread/resume returned an invalid thread status")
+    return status_type
+
+
+def find_queued_origin_message(
+    client: AppServerClient,
+    thread_id: str,
+    client_message_id: str,
+) -> dict[str, Any] | None:
+    cursor: str | None = None
+    for _page in range(2):
+        params: dict[str, Any] = {"threadId": thread_id, "limit": 100}
+        if cursor is not None:
+            params["cursor"] = cursor
+        response = client.request("thread/queue/list", params)
+        entries = response.get("data")
+        if not isinstance(entries, list):
+            raise AppServerProtocolError("thread/queue/list returned invalid data")
+        for entry in entries:
+            if isinstance(entry, dict) and entry.get("clientUserMessageId") == client_message_id:
+                return entry
+        next_cursor = response.get("nextCursor")
+        if next_cursor is None:
+            return None
+        if not isinstance(next_cursor, str) or not next_cursor:
+            raise AppServerProtocolError("thread/queue/list returned an invalid cursor")
+        cursor = next_cursor
+    raise AppServerProtocolError("thread/queue/list exceeded the documented queue capacity")
+
+
+def enqueue_origin_message_if_supported(
+    client: AppServerClient,
+    thread_id: str,
+    client_message_id: str,
+    message: str,
+) -> dict[str, Any] | None:
+    try:
+        existing = find_queued_origin_message(client, thread_id, client_message_id)
+    except AppServerRequestError as exc:
+        if app_server_method_unavailable(exc):
+            return None
+        raise
+    if existing is not None:
+        return {"queued_submission": existing, "already_present": True}
+    try:
+        response = client.request(
+            "thread/queue/add",
+            {
+                "threadId": thread_id,
+                "input": [{"type": "text", "text": message}],
+                "clientUserMessageId": client_message_id,
+            },
+        )
+    except AppServerRequestError as exc:
+        if app_server_method_unavailable(exc):
+            return None
+        raise
+    except (AppServerTransportError, TimeoutError) as exc:
+        raise OriginQueueOutcomeUnknown(
+            "thread/queue/add response was lost; refusing to retry an uncertain delivery"
+        ) from exc
+    queued_submission = response.get("queuedSubmission")
+    if not isinstance(queued_submission, dict) or not queued_submission.get("id"):
+        raise AppServerProtocolError("thread/queue/add returned an invalid queued submission")
+    return {"queued_submission": queued_submission, "already_present": False}
+
+
+def wait_for_origin_delivery_route(
+    config: dict[str, Any],
+    message: str,
+    progress: Callable[[dict[str, Any]], None],
+) -> dict[str, Any]:
+    """Queue durably when supported, otherwise wait for a real idle status event."""
+
+    socket_path = Path(config["app_server_socket"])
+    thread_id = config["thread_id"]
+    deadline = time.monotonic() + config["idle_timeout_seconds"]
+    connection_attempts = 0
+    reconnect_index = 0
+    initial_status: str | None = None
+    queue_supported: bool | None = None
+
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise OriginSessionIdleTimeout("origin Codex thread did not become idle before the deadline")
+        connection_attempts += 1
+        progress(
+            {
+                "status": "waiting_for_idle",
+                "connection_attempts": connection_attempts,
+                "idle_gate": "connecting",
+            }
+        )
+        try:
+            with AppServerClient(socket_path, timeout_seconds=min(15, remaining)) as client:
+                response = client.request(
+                    "thread/resume",
+                    {"threadId": thread_id, "excludeTurns": True},
+                    timeout_seconds=min(30, remaining),
+                )
+                status_type = extract_thread_status(response)
+                if initial_status is None:
+                    initial_status = status_type
+                progress(
+                    {
+                        "status": "waiting_for_idle",
+                        "idle_gate": "subscribed",
+                        "last_observed_thread_status": status_type,
+                        "last_observed_at": utc_now(),
+                    }
+                )
+
+                queued = enqueue_origin_message_if_supported(
+                    client,
+                    thread_id,
+                    config["client_user_message_id"],
+                    message,
+                )
+                if queued is not None:
+                    queue_supported = True
+                    entry = queued["queued_submission"]
+                    return {
+                        "delivery": "app-server-queue",
+                        "connection_attempts": connection_attempts,
+                        "initial_thread_status": initial_status,
+                        "last_thread_status": status_type,
+                        "queued_submission_id": entry["id"],
+                        "already_present": queued["already_present"],
+                    }
+                queue_supported = False
+
+                if status_type in {"idle", "notLoaded"}:
+                    return {
+                        "delivery": "codex-exec-resume",
+                        "connection_attempts": connection_attempts,
+                        "initial_thread_status": initial_status,
+                        "last_thread_status": status_type,
+                        "queue_supported": queue_supported,
+                    }
+                if status_type == "systemError":
+                    raise AppServerProtocolError("origin Codex thread is in systemError")
+
+                progress(
+                    {
+                        "status": "waiting_for_idle",
+                        "idle_gate": "waiting_on_status_event",
+                        "last_observed_thread_status": "active",
+                    }
+                )
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise OriginSessionIdleTimeout(
+                            "origin Codex thread did not become idle before the deadline"
+                        )
+                    notification = client.next_notification(remaining)
+                    if notification.get("method") != "thread/status/changed":
+                        continue
+                    params = notification.get("params")
+                    if not isinstance(params, dict) or params.get("threadId") != thread_id:
+                        continue
+                    status = params.get("status")
+                    event_status = status.get("type") if isinstance(status, dict) else None
+                    if event_status not in {"active", "idle", "notLoaded", "systemError"}:
+                        raise AppServerProtocolError(
+                            "thread/status/changed carried an invalid thread status"
+                        )
+                    progress(
+                        {
+                            "status": "waiting_for_idle",
+                            "idle_gate": "waiting_on_status_event",
+                            "last_observed_thread_status": event_status,
+                            "last_observed_at": utc_now(),
+                        }
+                    )
+                    if event_status in {"idle", "notLoaded"}:
+                        return {
+                            "delivery": "codex-exec-resume",
+                            "connection_attempts": connection_attempts,
+                            "initial_thread_status": initial_status,
+                            "last_thread_status": event_status,
+                            "queue_supported": queue_supported,
+                        }
+                    if event_status == "systemError":
+                        raise AppServerProtocolError("origin Codex thread entered systemError")
+        except OriginSessionIdleTimeout:
+            raise
+        except (AppServerRequestError, AppServerProtocolError):
+            raise
+        except (AppServerTransportError, TimeoutError) as exc:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise OriginSessionIdleTimeout(
+                    "origin Codex thread did not become idle before the deadline"
+                ) from exc
+            delay = APP_SERVER_RECONNECT_DELAYS[
+                min(reconnect_index, len(APP_SERVER_RECONNECT_DELAYS) - 1)
+            ]
+            reconnect_index += 1
+            progress(
+                {
+                    "status": "waiting_for_idle",
+                    "idle_gate": "reconnecting",
+                    "last_connection_error": one_line(str(exc))[:500],
+                    "next_reconnect_seconds": min(delay, remaining),
+                }
+            )
+            time.sleep(min(delay, remaining))
 
 
 def normalize_project(value: str) -> str:
@@ -272,13 +831,12 @@ def render_session_message(request: dict[str, Any], state: dict[str, Any]) -> st
     return config["message_template"].format_map(values).strip()
 
 
-def dispatch_origin_session(
+def spawn_codex_resume(
     task_dir: Path,
     request: dict[str, Any],
-    state: dict[str, Any],
+    message: str,
 ) -> dict[str, Any]:
     config = request["origin_session_resume"]
-    message = render_session_message(request, state)
     log_path = task_dir / "session-resume.log"
     try:
         with log_path.open("ab", buffering=0) as log_handle:
@@ -323,6 +881,66 @@ def dispatch_origin_session(
         }
 
 
+def dispatch_origin_session(
+    task_dir: Path,
+    request: dict[str, Any],
+    state: dict[str, Any],
+    progress: Callable[[dict[str, Any]], None] | None = None,
+    message: str | None = None,
+) -> dict[str, Any]:
+    config = request["origin_session_resume"]
+    rendered_message = message if message is not None else render_session_message(request, state)
+    message_hash = hashlib.sha256(rendered_message.encode("utf-8")).hexdigest()
+    if not config.get("idle_gate_enabled", False):
+        result = spawn_codex_resume(task_dir, request, rendered_message)
+        result["idle_gate"] = {
+            "mode": "unavailable",
+            "reason": "App Server Unix socket was unavailable when the monitor task was created",
+        }
+        return result
+
+    publish = progress or (lambda _update: None)
+    try:
+        route = wait_for_origin_delivery_route(config, rendered_message, publish)
+        if route["delivery"] == "app-server-queue":
+            return {
+                "status": "queued",
+                "method": "app-server-thread-queue",
+                "thread_id": config["thread_id"],
+                "queued_submission_id": route["queued_submission_id"],
+                "client_user_message_id": config["client_user_message_id"],
+                "already_present": route["already_present"],
+                "queued_at": utc_now(),
+                "message_sha256": message_hash,
+                "idle_gate": {
+                    "mode": "durable-app-server-queue",
+                    "connection_attempts": route["connection_attempts"],
+                    "initial_thread_status": route["initial_thread_status"],
+                    "last_thread_status": route["last_thread_status"],
+                },
+            }
+        result = spawn_codex_resume(task_dir, request, rendered_message)
+        result["idle_gate"] = {
+            "mode": "app-server-status-events",
+            "connection_attempts": route["connection_attempts"],
+            "initial_thread_status": route["initial_thread_status"],
+            "last_thread_status": route["last_thread_status"],
+            "queue_supported": route["queue_supported"],
+            "released_at": utc_now(),
+        }
+        return result
+    except Exception as exc:
+        return {
+            "status": "failed",
+            "method": "app-server-idle-gate",
+            "thread_id": config["thread_id"],
+            "failed_at": utc_now(),
+            "error": one_line(str(exc))[:500],
+            "message_sha256": message_hash,
+            "log": str(task_dir / "session-resume.log"),
+        }
+
+
 def finalize_terminal_state(
     task_dir: Path,
     request: dict[str, Any],
@@ -331,7 +949,31 @@ def finalize_terminal_state(
     write_state(task_dir, state, terminal=True)
     if "origin_session_resume" not in request or "origin_session_resume" in state:
         return
-    state["origin_session_resume"] = dispatch_origin_session(task_dir, request, state)
+    config = request["origin_session_resume"]
+    message = render_session_message(request, state)
+    resume_state: dict[str, Any] = {
+        "status": "waiting_for_idle" if config.get("idle_gate_enabled", False) else "dispatching",
+        "method": "app-server-idle-gate" if config.get("idle_gate_enabled", False) else "codex-exec-resume",
+        "thread_id": config["thread_id"],
+        "client_user_message_id": config.get("client_user_message_id"),
+        "message_sha256": hashlib.sha256(message.encode("utf-8")).hexdigest(),
+        "waiting_since": utc_now(),
+    }
+    state["origin_session_resume"] = resume_state
+    write_state(task_dir, state, terminal=True)
+
+    def persist_progress(update: dict[str, Any]) -> None:
+        resume_state.update(update)
+        state["origin_session_resume"] = resume_state
+        write_state(task_dir, state, terminal=True)
+
+    state["origin_session_resume"] = dispatch_origin_session(
+        task_dir,
+        request,
+        state,
+        progress=persist_progress,
+        message=message,
+    )
     write_state(task_dir, state, terminal=True)
 
 
@@ -532,15 +1174,32 @@ def resolve_codex_binary(value: str) -> str:
     return resolved_command
 
 
-def build_origin_session_resume(args: argparse.Namespace) -> dict[str, str] | None:
+def is_unix_socket(path: Path) -> bool:
+    try:
+        return stat.S_ISSOCK(path.stat().st_mode)
+    except OSError:
+        return False
+
+
+def build_origin_session_resume(args: argparse.Namespace) -> dict[str, Any] | None:
     if not args.resume_origin_session:
         if args.session_message:
             raise ValueError("--session-message requires --resume-origin-session")
         return None
+    idle_timeout_seconds = int(getattr(args, "session_idle_timeout_minutes", 1440) * 60)
+    if idle_timeout_seconds < 60:
+        raise ValueError("origin-session idle timeout must be at least one minute")
+    socket_path = Path(
+        getattr(args, "app_server_socket", str(DEFAULT_APP_SERVER_SOCKET))
+    ).expanduser().resolve()
     return {
         "thread_id": normalize_thread_id(args.origin_thread_id),
         "message_template": validate_session_message_template(args.session_message or ""),
         "codex_binary": resolve_codex_binary(args.codex_binary),
+        "client_user_message_id": str(uuid.uuid4()),
+        "app_server_socket": str(socket_path),
+        "idle_gate_enabled": is_unix_socket(socket_path),
+        "idle_timeout_seconds": idle_timeout_seconds,
     }
 
 
@@ -690,7 +1349,7 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--resume-origin-session",
         action="store_true",
-        help="dispatch one codex exec resume event to the exact origin thread at terminal state",
+        help="deliver one follow-up to the exact origin thread after it becomes idle",
     )
     parser.add_argument(
         "--origin-thread-id",
@@ -705,6 +1364,17 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
         "--codex-binary",
         default="codex",
         help="Codex executable used for the one-shot resume event",
+    )
+    parser.add_argument(
+        "--app-server-socket",
+        default=str(DEFAULT_APP_SERVER_SOCKET),
+        help="managed Codex App Server Unix socket used for event-driven idle detection",
+    )
+    parser.add_argument(
+        "--session-idle-timeout-minutes",
+        type=float,
+        default=1440,
+        help="maximum wait for the origin Codex thread to become idle; default: 1440",
     )
     parser.add_argument("command", nargs=argparse.REMAINDER, help="command and arguments after --")
 

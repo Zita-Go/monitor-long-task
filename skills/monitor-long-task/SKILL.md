@@ -1,6 +1,6 @@
 ---
 name: monitor-long-task
-description: Run and monitor detached long-running commands or explicit completion checks, persist structured state, send a Feishu/Lark webhook after verified success, and resume the exact originating Codex session once at terminal state by default when its thread ID is available. Use for builds, tests, experiments, imports, downloads, migrations, batch jobs, or external convergence expected to take at least 10 minutes or continue beyond the current Codex turn; do not use for ordinary short commands.
+description: Run and monitor detached long-running commands or explicit completion checks, persist structured state, send a Feishu/Lark webhook after verified success, and deliver one follow-up to the exact originating Codex session after its active turn becomes idle. Use for builds, tests, experiments, imports, downloads, migrations, batch jobs, or external convergence expected to take at least 10 minutes or continue beyond the current Codex turn; do not use for ordinary short commands.
 ---
 
 # 长任务完成监控
@@ -30,7 +30,7 @@ python3 "$MONITOR" configure
 
 ## 默认：结束后唤醒原会话
 
-从 Codex 会话启动长任务且环境中存在精确 `CODEX_THREAD_ID` 时，默认启用 `--resume-origin-session`。只有用户明确要求“只发飞书”“不要回原会话”或同等意图时才关闭。这是终态事件触发的一次性续接，不要创建 Automation、定时任务或任何会话轮询。
+从 Codex 会话启动长任务且环境中存在精确 `CODEX_THREAD_ID` 时，默认启用 `--resume-origin-session`。只有用户明确要求“只发飞书”“不要回原会话”或同等意图时才关闭。这是终态事件触发的一次性续接，不要创建 Automation、定时任务，不要根据输出静默时间判断会话是否空闲。
 
 1. 确认环境中存在精确的 `CODEX_THREAD_ID`，不要使用 `--last`。缺少线程 ID 时继续执行任务但不启用续接，并向用户如实说明。
 2. 根据当前任务上下文自行编写 `--session-message`；脚本不固定消息内容。
@@ -43,7 +43,15 @@ python3 "$MONITOR" configure
 --session-message '后台任务已进入 {status}。请读取 {summary_file} 和 {task_log}，基于真实结果自行继续原任务；不要重新启动该任务。'
 ```
 
-任务进入任一终态时，worker 仅执行一次 `codex exec resume "$CODEX_THREAD_ID" -`，从标准输入发送 Agent 编写的消息。该操作会产生一个新的 Codex turn；若续接启动失败，只记录 `origin_session_resume.status=failed`，不循环重试。
+任务进入任一终态时，worker 按以下顺序处理：
+
+1. 如果有可用的 Codex App Server Unix socket，读取精确线程的正式状态。只有 `status.type=active` 表示 Agent 正在运行；仅打开或聚焦一个无运行 turn 的会话仍是 `idle`。
+2. App Server 支持持久消息队列时，将消息一次性加入 `thread/queue/add`；由 App Server 在该线程 idle 后启动。
+3. 较旧 App Server 不支持队列时，订阅 `thread/status/changed`；active 时阻塞等待事件，idle 时才执行一次 `codex exec resume "$CODEX_THREAD_ID" -`。
+4. 连接中断时只做有上限的传输重连；连接正常时绝不轮询线程状态。
+5. 没有 managed App Server socket 的独立 CLI 环境无法读取跨进程实时状态，此时保留原有的一次性 resume，并在状态中明确记录 idle gate 不可用。
+
+消息始终从标准输入传递。续接失败只影响 `origin_session_resume`，不能改写长任务或飞书通知的真实结果。
 
 ## 启动托管命令
 
@@ -85,7 +93,7 @@ python3 "$MONITOR" watch \
 python3 "$MONITOR" status <task_id>
 ```
 
-3. 向用户报告任务 ID、状态文件和日志路径，然后结束当前回合。Webhook 发送不依赖 Codex 回合继续运行。
+3. 向用户报告任务 ID、状态文件和日志路径。后台 worker 不占用 Agent 的终端等待；若当前请求还有无需等待长任务即可完成的分析或操作，继续处理。没有其他可做工作时再结束当前回合，Webhook 与原会话续接均不依赖本回合保持运行。
 
 ## 状态纪律
 
@@ -93,7 +101,10 @@ python3 "$MONITOR" status <task_id>
 - `completed_notification_failed`：任务成功但通知失败；使用 `retry-notification <task_id>` 重试，不能说通知已发送。
 - `failed`、`start_failed`、`monitor_failed`：任务未完成，不发送“完成”消息。
 - `timed_out`：监控超时；托管任务不会被自动终止。检查真实进程状态后再决定是否继续监控或终止。
-- `origin_session_resume.status=dispatched`：已启动一次精确原会话续接；后续 CLI 结果查看 `session-resume.log`。`failed` 表示续接进程未能启动，不进行轮询或自动重试。
+- `origin_session_resume.status=waiting_for_idle`：已持久化消息摘要，正在连接 App Server 或等待精确线程的 idle 事件。
+- `origin_session_resume.status=queued`：新版 App Server 的持久队列已接受消息，将在原线程 idle 后启动。
+- `origin_session_resume.status=dispatched`：旧版 App Server 路径已在确认 idle 后启动一次精确续接，或无 socket 的独立 CLI 路径已执行单次兼容派发；后续 CLI 结果查看 `session-resume.log` 和 `idle_gate`。
+- `origin_session_resume.status=failed`：idle 等待超时、线程处于 `systemError` 或续接无法派发；不把它误报为成功。
 - 状态、终态摘要和日志默认保存在 `${CODEX_HOME:-$HOME/.codex}/long-task-monitors/<task_id>/`。
 
 不要读取、打印或提交 webhook 密钥文件。脚本仅接受官方 Feishu/Lark 机器人 URL，并要求密钥文件权限不宽于 `0600`。

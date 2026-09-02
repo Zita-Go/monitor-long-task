@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import socket
 import stat
 import subprocess
 import sys
@@ -253,6 +254,322 @@ class LongTaskMonitorTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unknown session message field"):
             monitor.build_origin_session_resume(arguments)
 
+    def test_origin_session_config_enables_idle_gate_for_unix_socket(self) -> None:
+        thread_id = "01a042ae-2b44-7a00-9d98-60cb16f9e5d4"
+        socket_path = self.root / "app-server.sock"
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as app_server_socket:
+            app_server_socket.bind(str(socket_path))
+            arguments = SimpleNamespace(
+                resume_origin_session=True,
+                origin_thread_id=thread_id,
+                session_message="任务进入 {status}，请读取 {summary_file} 后自行继续。",
+                codex_binary=sys.executable,
+                app_server_socket=str(socket_path),
+                session_idle_timeout_minutes=12,
+            )
+            config = monitor.build_origin_session_resume(arguments)
+
+        self.assertTrue(config["idle_gate_enabled"])
+        self.assertEqual(config["app_server_socket"], str(socket_path))
+        self.assertEqual(config["idle_timeout_seconds"], 720)
+        self.assertEqual(str(monitor.uuid.UUID(config["client_user_message_id"])), config["client_user_message_id"])
+
+    def test_idle_gate_waits_for_matching_status_event_without_polling(self) -> None:
+        thread_id = "01a042ae-2b44-7a00-9d98-60cb16f9e5d4"
+        requests: list[str] = []
+
+        class FakeClient:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                self.notifications = iter(
+                    [
+                        {
+                            "method": "thread/status/changed",
+                            "params": {
+                                "threadId": "019fefe7-c884-7971-bbe2-5c08ede61683",
+                                "status": {"type": "idle"},
+                            },
+                        },
+                        {
+                            "method": "thread/status/changed",
+                            "params": {
+                                "threadId": thread_id,
+                                "status": {"type": "active", "activeFlags": []},
+                            },
+                        },
+                        {
+                            "method": "thread/status/changed",
+                            "params": {
+                                "threadId": thread_id,
+                                "status": {"type": "idle"},
+                            },
+                        },
+                    ]
+                )
+
+            def __enter__(self) -> "FakeClient":
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def request(
+                self,
+                method: str,
+                _params: dict[str, object],
+                timeout_seconds: float | None = None,
+            ) -> dict[str, object]:
+                del timeout_seconds
+                requests.append(method)
+                if method == "thread/resume":
+                    return {"thread": {"status": {"type": "active", "activeFlags": []}}}
+                if method == "thread/queue/list":
+                    raise monitor.AppServerRequestError(
+                        method,
+                        {"code": -32600, "message": "unknown variant `thread/queue/list`"},
+                    )
+                raise AssertionError(f"unexpected request: {method}")
+
+            def next_notification(self, _timeout_seconds: float) -> dict[str, object]:
+                return next(self.notifications)
+
+        progress: list[dict[str, object]] = []
+        config = {
+            "app_server_socket": str(self.root / "app-server.sock"),
+            "thread_id": thread_id,
+            "client_user_message_id": str(monitor.uuid.uuid4()),
+            "idle_timeout_seconds": 60,
+        }
+        with mock.patch.object(monitor, "AppServerClient", FakeClient):
+            route = monitor.wait_for_origin_delivery_route(config, "继续处理", progress.append)
+
+        self.assertEqual(route["delivery"], "codex-exec-resume")
+        self.assertEqual(route["initial_thread_status"], "active")
+        self.assertEqual(route["last_thread_status"], "idle")
+        self.assertEqual(requests, ["thread/resume", "thread/queue/list"])
+        observed = [update.get("last_observed_thread_status") for update in progress]
+        self.assertEqual(observed, [None, "active", "active", "active", "idle"])
+
+    def test_idle_gate_treats_open_idle_thread_as_ready(self) -> None:
+        thread_id = "01a042ae-2b44-7a00-9d98-60cb16f9e5d4"
+
+        class IdleClient:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                pass
+
+            def __enter__(self) -> "IdleClient":
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def request(
+                self,
+                method: str,
+                _params: dict[str, object],
+                timeout_seconds: float | None = None,
+            ) -> dict[str, object]:
+                del timeout_seconds
+                if method == "thread/resume":
+                    return {"thread": {"status": {"type": "idle"}}}
+                if method == "thread/queue/list":
+                    raise monitor.AppServerRequestError(
+                        method,
+                        {"code": -32601, "message": "Method not found"},
+                    )
+                raise AssertionError(f"unexpected request: {method}")
+
+            def next_notification(self, _timeout_seconds: float) -> dict[str, object]:
+                raise AssertionError("an idle thread must not wait for another event")
+
+        config = {
+            "app_server_socket": str(self.root / "app-server.sock"),
+            "thread_id": thread_id,
+            "client_user_message_id": str(monitor.uuid.uuid4()),
+            "idle_timeout_seconds": 60,
+        }
+        with mock.patch.object(monitor, "AppServerClient", IdleClient):
+            route = monitor.wait_for_origin_delivery_route(config, "继续处理", lambda _update: None)
+
+        self.assertEqual(route["delivery"], "codex-exec-resume")
+        self.assertEqual(route["initial_thread_status"], "idle")
+        self.assertEqual(route["last_thread_status"], "idle")
+
+    def test_idle_gate_prefers_durable_app_server_queue(self) -> None:
+        thread_id = "01a042ae-2b44-7a00-9d98-60cb16f9e5d4"
+        client_message_id = str(monitor.uuid.uuid4())
+        requests: list[tuple[str, dict[str, object]]] = []
+
+        class QueueClient:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                pass
+
+            def __enter__(self) -> "QueueClient":
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def request(
+                self,
+                method: str,
+                params: dict[str, object],
+                timeout_seconds: float | None = None,
+            ) -> dict[str, object]:
+                del timeout_seconds
+                requests.append((method, params))
+                if method == "thread/resume":
+                    return {"thread": {"status": {"type": "active", "activeFlags": []}}}
+                if method == "thread/queue/list":
+                    return {"data": [], "nextCursor": None}
+                if method == "thread/queue/add":
+                    return {
+                        "queuedSubmission": {
+                            "id": "queued-1",
+                            "input": params["input"],
+                            "clientUserMessageId": params["clientUserMessageId"],
+                        }
+                    }
+                raise AssertionError(f"unexpected request: {method}")
+
+            def next_notification(self, _timeout_seconds: float) -> dict[str, object]:
+                raise AssertionError("durable queue acceptance must finish the waiter")
+
+        config = {
+            "app_server_socket": str(self.root / "app-server.sock"),
+            "thread_id": thread_id,
+            "client_user_message_id": client_message_id,
+            "idle_timeout_seconds": 60,
+        }
+        with mock.patch.object(monitor, "AppServerClient", QueueClient):
+            route = monitor.wait_for_origin_delivery_route(config, "由 Agent 决定的消息", lambda _update: None)
+
+        self.assertEqual(route["delivery"], "app-server-queue")
+        self.assertEqual(route["queued_submission_id"], "queued-1")
+        self.assertFalse(route["already_present"])
+        self.assertEqual([method for method, _params in requests], [
+            "thread/resume",
+            "thread/queue/list",
+            "thread/queue/add",
+        ])
+        self.assertEqual(requests[-1][1]["clientUserMessageId"], client_message_id)
+        self.assertEqual(requests[-1][1]["input"], [{"type": "text", "text": "由 Agent 决定的消息"}])
+
+    def test_queue_add_with_unknown_outcome_is_not_retried(self) -> None:
+        class UncertainQueueClient:
+            def request(
+                self,
+                method: str,
+                _params: dict[str, object],
+                timeout_seconds: float | None = None,
+            ) -> dict[str, object]:
+                del timeout_seconds
+                if method == "thread/queue/list":
+                    return {"data": [], "nextCursor": None}
+                if method == "thread/queue/add":
+                    raise monitor.AppServerTransportError("response lost")
+                raise AssertionError(f"unexpected request: {method}")
+
+        with self.assertRaisesRegex(
+            monitor.OriginQueueOutcomeUnknown,
+            "refusing to retry",
+        ):
+            monitor.enqueue_origin_message_if_supported(
+                UncertainQueueClient(),
+                "01a042ae-2b44-7a00-9d98-60cb16f9e5d4",
+                str(monitor.uuid.uuid4()),
+                "继续处理",
+            )
+
+    def test_idle_gate_reconnects_only_after_transport_failure(self) -> None:
+        thread_id = "01a042ae-2b44-7a00-9d98-60cb16f9e5d4"
+
+        class ReconnectingClient:
+            created = 0
+
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                self.number = ReconnectingClient.created
+                ReconnectingClient.created += 1
+
+            def __enter__(self) -> "ReconnectingClient":
+                if self.number == 0:
+                    raise monitor.AppServerTransportError("daemon restarted")
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def request(
+                self,
+                method: str,
+                _params: dict[str, object],
+                timeout_seconds: float | None = None,
+            ) -> dict[str, object]:
+                del timeout_seconds
+                if method == "thread/resume":
+                    return {"thread": {"status": {"type": "idle"}}}
+                if method == "thread/queue/list":
+                    raise monitor.AppServerRequestError(
+                        method,
+                        {"code": -32601, "message": "Method not found"},
+                    )
+                raise AssertionError(f"unexpected request: {method}")
+
+        progress: list[dict[str, object]] = []
+        config = {
+            "app_server_socket": str(self.root / "app-server.sock"),
+            "thread_id": thread_id,
+            "client_user_message_id": str(monitor.uuid.uuid4()),
+            "idle_timeout_seconds": 60,
+        }
+        with (
+            mock.patch.object(monitor, "AppServerClient", ReconnectingClient),
+            mock.patch.object(monitor.time, "sleep") as sleep,
+        ):
+            route = monitor.wait_for_origin_delivery_route(config, "继续处理", progress.append)
+
+        self.assertEqual(route["connection_attempts"], 2)
+        sleep.assert_called_once_with(1)
+        self.assertIn("reconnecting", [update.get("idle_gate") for update in progress])
+
+    def test_websocket_upgrade_accept_key_is_validated(self) -> None:
+        key = "dGhlIHNhbXBsZSBub25jZQ=="
+        valid = (
+            b"HTTP/1.1 101 Switching Protocols\r\n"
+            b"Upgrade: websocket\r\n"
+            b"Connection: Upgrade\r\n"
+            b"Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+        )
+        monitor.UnixWebSocketConnection._validate_upgrade_response(valid, key)
+        with self.assertRaisesRegex(monitor.AppServerProtocolError, "invalid WebSocket accept key"):
+            monitor.UnixWebSocketConnection._validate_upgrade_response(
+                valid.replace(b"s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", b"invalid"),
+                key,
+            )
+
+    def test_status_observer_does_not_answer_interactive_server_requests(self) -> None:
+        messages = iter(
+            [
+                {
+                    "id": 77,
+                    "method": "item/tool/requestUserInput",
+                    "params": {"threadId": "origin"},
+                },
+                {
+                    "method": "thread/status/changed",
+                    "params": {"threadId": "origin", "status": {"type": "idle"}},
+                },
+            ]
+        )
+
+        class FakeConnection:
+            def receive_json(self, _timeout_seconds: float) -> dict[str, object]:
+                return next(messages)
+
+        client = monitor.AppServerClient(self.root / "unused.sock")
+        client.connection = FakeConnection()
+        notification = client.next_notification(10)
+        self.assertEqual(notification["method"], "thread/status/changed")
+
     def test_origin_session_resume_dispatches_once_without_polling(self) -> None:
         task_dir = self.root / "origin-session"
         task_dir.mkdir()
@@ -295,7 +612,69 @@ class LongTaskMonitorTests(unittest.TestCase):
         self.assertEqual(resume["status"], "dispatched")
         self.assertEqual(resume["thread_id"], thread_id)
         self.assertEqual(resume["pid"], 4242)
+        self.assertEqual(resume["idle_gate"]["mode"], "unavailable")
         self.assertEqual(stat.S_IMODE((task_dir / "session-resume.log").stat().st_mode), 0o600)
+
+    def test_origin_session_queue_persists_waiting_state_and_does_not_spawn_cli(self) -> None:
+        task_dir = self.root / "origin-session-queue"
+        task_dir.mkdir()
+        thread_id = "01a042ae-2b44-7a00-9d98-60cb16f9e5d4"
+        client_message_id = str(monitor.uuid.uuid4())
+        request = self.request("origin-session-queue", "launch", [sys.executable, "-c", "pass"])
+        request["origin_session_resume"] = {
+            "thread_id": thread_id,
+            "message_template": "任务进入 {status}，请读取 {summary_file}。",
+            "codex_binary": sys.executable,
+            "client_user_message_id": client_message_id,
+            "app_server_socket": str(self.root / "app-server.sock"),
+            "idle_gate_enabled": True,
+            "idle_timeout_seconds": 60,
+        }
+        state = monitor.initial_state(task_dir, request, "failed")
+        state["exit_code"] = 3
+        waiting_snapshots: list[dict[str, object]] = []
+
+        def fake_route(
+            _config: dict[str, object],
+            _message: str,
+            progress: object,
+        ) -> dict[str, object]:
+            progress(
+                {
+                    "status": "waiting_for_idle",
+                    "idle_gate": "waiting_on_status_event",
+                    "last_observed_thread_status": "active",
+                }
+            )
+            waiting_snapshots.append(json.loads((task_dir / "summary.json").read_text()))
+            return {
+                "delivery": "app-server-queue",
+                "connection_attempts": 1,
+                "initial_thread_status": "active",
+                "last_thread_status": "active",
+                "queued_submission_id": "queued-1",
+                "already_present": False,
+            }
+
+        with (
+            mock.patch.object(monitor, "wait_for_origin_delivery_route", side_effect=fake_route) as waiter,
+            mock.patch.object(monitor.subprocess, "Popen") as popen,
+        ):
+            monitor.finalize_terminal_state(task_dir, request, state)
+            monitor.finalize_terminal_state(task_dir, request, state)
+
+        waiter.assert_called_once()
+        popen.assert_not_called()
+        self.assertEqual(
+            waiting_snapshots[0]["origin_session_resume"]["last_observed_thread_status"],
+            "active",
+        )
+        final_state = json.loads((task_dir / "summary.json").read_text())
+        resume = final_state["origin_session_resume"]
+        self.assertEqual(resume["status"], "queued")
+        self.assertEqual(resume["method"], "app-server-thread-queue")
+        self.assertEqual(resume["client_user_message_id"], client_message_id)
+        self.assertEqual(resume["queued_submission_id"], "queued-1")
 
     def test_origin_session_resume_passes_agent_message_over_stdin(self) -> None:
         task_dir = self.root / "origin-session-subprocess"

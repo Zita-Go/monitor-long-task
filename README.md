@@ -82,22 +82,27 @@ Agent 会自行决定项目名、摘要、超时时间以及使用 `launch` 还�
 
 ## 事件驱动续接原 Codex 会话
 
-当长任务从 Codex 会话启动且存在精确 `CODEX_THREAD_ID` 时，Agent 默认启用 `--resume-origin-session`，并根据任务上下文自行编写续接消息。用户明确要求“只发飞书”或“不要回原会话”时才关闭。任务进入成功、失败或超时等终态后，worker 单次调用官方 [`codex exec resume`](https://learn.chatgpt.com/docs/developer-commands#codex-exec)：
+当长任务从 Codex 会话启动且存在精确 `CODEX_THREAD_ID` 时，Agent 默认启用原会话续接，并根据任务上下文自行编写消息。用户明确要求“只发飞书”或“不要回原会话”时才关闭。
 
-```text
-codex exec resume <原线程ID> -
-```
+长任务进入成功、失败或超时等终态后，worker 会先持久化续接意图和消息摘要，再连接当前 Codex App Server：
 
-消息经 stdin 传递，不出现在进程参数中。新的 Codex turn 会回到原会话，读取状态、检查产物并自行决定后续工作。
+- 原线程是 `active`：表示确实有 turn 正在运行，等待正式状态事件；
+- 原线程是 `idle`：立即交付，不会因为会话窗口仍打开或处于焦点而等待；
+- 新版 App Server 支持 `thread/queue/*`：消息进入官方持久队列，由 App Server 在 idle 后按顺序启动；
+- 较旧 App Server：订阅 `thread/status/changed`，收到目标线程的 idle 事件后才单次调用 [`codex exec resume`](https://learn.chatgpt.com/docs/developer-commands#codex-exec)。
+
+整个判断只使用 Codex 的 `ThreadStatus`，不检查“多久没有输出”、日志时间戳或窗口焦点。健康连接会一直阻塞等待事件；App Server 重启或连接断开时才进行有上限的传输重连，并在重连时恢复订阅。
 
 这个过程：
 
 - 由任务终态事件直接触发；
 - 不创建 Automation 或定时任务；
-- 不轮询原会话；
+- 不轮询原会话状态；
 - 不使用容易误选会话的 `--last`；
-- 每个监控任务最多派发一次；
-- 失败时只记录日志，不自动重试。
+- 每个监控任务只接受或启动一条续接消息；
+- 飞书结果、长任务结果和原会话续接结果分别记录，不互相伪装。
+
+没有 managed App Server Unix socket 的独立 CLI 环境无法读取另一个进程中的实时状态。为了兼容旧用法，此时保留单次 `codex exec resume <原线程ID> -`，并在状态文件中明确写出 idle gate 不可用。通过 Desktop、IDE 或 managed App Server 运行时会自动使用事件驱动路径。
 
 续接消息不是脚本写死的。Agent 可在消息中引用 `{status}`、`{summary_file}`、`{task_log}`、`{exit_code}` 和 `{error}` 等终态字段。例如：
 
@@ -106,7 +111,7 @@ codex exec resume <原线程ID> -
 --session-message '后台任务已进入 {status}。请读取 {summary_file} 和 {task_log}，基于真实结果自行继续原任务；不要重新启动该任务。'
 ```
 
-续接会产生一个额外 Codex turn。该默认行为由 Skill 的 Agent 决策规则实现；脱离 Agent 直接调用底层 CLI 时，仍需显式传入 `--resume-origin-session`。缺少精确线程 ID 时，Agent 不启用续接，也绝不回退到 `--last`。
+续接会产生一个额外 Codex turn，消息内容由恢复后的 Agent 结合真实状态处理。该默认行为由 Skill 的 Agent 决策规则实现；脱离 Agent 直接调用底层 CLI 时，仍需显式传入 `--resume-origin-session`。缺少精确线程 ID 时，Agent 不启用续接，也绝不回退到 `--last`。协议和故障语义见 [event-driven session resume 设计](docs/event-driven-session-resume.md)。
 
 ## Agent 如何工作
 
@@ -117,7 +122,8 @@ flowchart LR
     M --> T[后台长任务]
     T -->|终态事件| M
     M -->|验证成功| F[飞书 / Lark]
-    M -->|可选：单次 resume| C[精确原 Codex 会话]
+    M --> S[Codex App Server]
+    S -->|idle 或持久队列| C[精确原 Codex 会话]
 ```
 
 普通用户不需要选择 CLI 参数。Agent 根据意图处理：
@@ -126,9 +132,9 @@ flowchart LR
 |---|---|---|
 | 托管本地构建、测试或训练命令 | 使用 `launch` 等待进程退出 | 否 |
 | 等待外部任务、明确标记或最终产物 | 使用 `watch` 检查完成条件 | 是，只检查显式外部条件 |
-| 一般长任务 | 默认启用 `--resume-origin-session` | 否，终态时单次派发 |
+| 一般长任务 | 默认启用原会话续接 | 否，等待正式 idle 事件 |
 | 明确只发飞书、不要回原会话 | 不启用原会话续接 | 不涉及 |
-| 要求结束后继续分析或汇总 | 启用 `--resume-origin-session` | 否，终态时单次派发 |
+| 要求结束后继续分析或汇总 | 启用原会话续接 | 否，等待正式 idle 事件 |
 | 普通短命令 | 不使用该 Skill | 不涉及 |
 
 默认行为：
@@ -136,6 +142,7 @@ flowchart LR
 - 飞书/Lark 只在验证成功后发送；失败和超时不伪装成“完成”。
 - 存在精确 `CODEX_THREAD_ID` 时，原会话续接默认开启；用户明确要求不返回时关闭。
 - 原会话续接本身从不轮询；`watch` 只服务于无法直接托管的外部条件。
+- 后台 worker 独立运行，不占用 Agent 等待；Agent 可以继续完成其他不依赖长任务结果的工作。
 - 超时不会自动杀死仍在运行的真实任务。
 
 ## 安装、更新与卸载
@@ -260,6 +267,18 @@ python3 "$MONITOR" launch \
 
 被托管命令应保持前台运行。退出码为 `0` 才视为成功；会自行 daemonize 的程序应改用 `watch`。
 
+### 原会话续接参数
+
+Agent 启用续接时会附加：
+
+```bash
+--resume-origin-session \
+--origin-thread-id "$CODEX_THREAD_ID" \
+--session-message '<由 Agent 根据任务上下文编写的消息>'
+```
+
+`--session-idle-timeout-minutes` 控制等待原线程 idle 的最长时间，默认 1440 分钟。`--app-server-socket` 只用于自定义 managed App Server socket；通常无需设置。脚本会在创建监控任务时记录该 socket 是否可用，普通用户不需要选择事件模式或队列模式。
+
 ### `watch`：检查外部完成条件
 
 ```bash
@@ -323,6 +342,15 @@ ${CODEX_HOME:-$HOME/.codex}/long-task-monitors/<task_id>/
 | `monitor_failed` | 监控器自身失败 |
 | `timed_out` | 监控超时；实际任务不会被自动终止 |
 
+`origin_session_resume` 独立记录续接状态：
+
+| 续接状态 | 含义 |
+|---|---|
+| `waiting_for_idle` | 消息摘要已持久化，正在连接 App Server 或等待目标线程 idle 事件 |
+| `queued` | App Server 持久队列已接受消息，将在目标线程 idle 后启动 |
+| `dispatched` | 兼容路径已确认 idle 并启动一次 `codex exec resume`，或在无 idle gate 环境中执行单次兼容派发 |
+| `failed` | 等待超时、线程 `systemError`、协议错误或续接进程无法启动 |
+
 关键文件：
 
 | 文件 | 用途 |
@@ -331,7 +359,7 @@ ${CODEX_HOME:-$HOME/.codex}/long-task-monitors/<task_id>/
 | `summary.json` | 终态摘要 |
 | `task.log` | 被托管命令或检查命令输出 |
 | `monitor.log` | 后台 worker 自身日志 |
-| `session-resume.log` | 原会话续接进程输出 |
+| `session-resume.log` | `codex exec resume` 兼容路径的输出；持久队列路径可能不创建此文件 |
 
 ### 飞书错误
 
@@ -346,8 +374,11 @@ ${CODEX_HOME:-$HOME/.codex}/long-task-monitors/<task_id>/
 
 - `origin thread id is required`：当前环境没有 `CODEX_THREAD_ID`；可以不启用续接，或显式传入 `--origin-thread-id <UUID>`。
 - `codex binary was not found`：确认 `codex` 位于 `PATH`，或传入 `--codex-binary /absolute/path/to/codex`。
+- `origin_session_resume.status=waiting_for_idle`：原线程仍是 `active`，或 App Server 正在重连；打开但没有运行 turn 的会话不会停在这里。
+- `origin_session_resume.status=queued`：消息已由 App Server 持久接收，不需要再手动执行 resume。
 - `origin_session_resume.status=dispatched` 只表示续接进程已启动；最终 CLI 错误查看 `session-resume.log`。
-- 原会话仍有活动 turn 时，续接可能失败；不会自动轮询或重试。
+- `origin_session_resume.status=failed`：查看其中的 `error`；长任务和飞书通知的状态仍以顶层字段为准。
+- `idle_gate.mode=unavailable`：创建监控任务时没有 managed App Server Unix socket，已使用独立 CLI 的单次兼容路径，无法提供跨进程 active/idle 保证。
 
 ### 安装或更新失败
 
