@@ -1,4 +1,7 @@
 interface:
   display_name: "Monitor Long Task / 长任务监控"
   short_description: "后台监控长任务，发送飞书并在原 Codex 会话空闲后续接"
-  default_prompt: "使用 $monitor-long-task 后台运行这个长任务，完成后通知并返回当前会话继续处理。"
+  default_prompt: "使用 $monitor-long-task 后台运行这个长任务；验证完成后发送飞书，并在原会话空闲时继续处理。"
+
+policy:
+  allow_implicit_invocation: true

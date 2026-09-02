@@ -733,6 +733,7 @@ class LongTaskMonitorTests(unittest.TestCase):
         self.assertIn("description:", skill_text.split("---", 2)[1])
         self.assertNotIn("/" + "root" + "/", skill_text)
         self.assertIn("$monitor-long-task", metadata_text)
+        self.assertIn("allow_implicit_invocation: true", metadata_text)
 
 
 if __name__ == "__main__":

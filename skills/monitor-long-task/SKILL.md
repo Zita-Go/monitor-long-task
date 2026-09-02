@@ -1,22 +1,22 @@
 ---
 name: monitor-long-task
-description: Run and monitor detached long-running commands or explicit completion checks, persist structured state, send a Feishu/Lark webhook after verified success, and deliver one follow-up to the exact originating Codex session after its active turn becomes idle. Use for builds, tests, experiments, imports, downloads, migrations, batch jobs, or external convergence expected to take at least 10 minutes or continue beyond the current Codex turn; do not use for ordinary short commands.
+description: Monitor detached commands or explicit completion checks, persist structured state, notify Feishu/Lark after verified success, and deliver one follow-up to the exact originating Codex session after its active turn becomes idle. Use for builds, tests, experiments, imports, downloads, migrations, batch jobs, or external convergence expected to run at least 10 minutes or outlive the current Codex turn; do not use for ordinary short commands.
 ---
 
 # 长任务完成监控
 
-使用 `scripts/long_task_monitor.py` 启动独立监控进程。只把退出码为 0 或显式检查命令返回 0 视为完成；失败、超时和通知失败必须如实记录，不能宣称完成。
+使用 `scripts/long_task_monitor.py` 启动独立 worker。只有被托管命令退出码为 0，或显式完成检查返回 0，才视为成功；如实记录失败、超时和通知失败。
 
 ## 准备
 
-解析安装目录，不要假设用户目录为 `/root`：
+解析安装路径，不要假设用户目录为 `/root`：
 
 ```bash
 MONITOR="${CODEX_HOME:-$HOME/.codex}/skills/monitor-long-task/scripts/long_task_monitor.py"
 test -f "$MONITOR"
 ```
 
-脚本默认从 `${CODEX_HOME:-$HOME/.codex}/secrets/feishu-long-task-webhook` 读取 webhook。缺少配置时，让用户在自己的终端安全运行以下命令；不要要求用户把 webhook 发到对话中：
+脚本默认读取 `${CODEX_HOME:-$HOME/.codex}/secrets/feishu-long-task-webhook`。缺少配置时，让用户在自己的终端运行以下命令；不要索要或读取 webhook：
 
 ```bash
 python3 "$MONITOR" configure
@@ -24,38 +24,26 @@ python3 "$MONITOR" configure
 
 ## 选择模式
 
-- 本地前台命令：使用 `launch`，让监控器托管命令。不要先单独启动同一命令。
-- 外部任务或会自行 daemonize 的命令：先确定幂等、只读的完成检查，再使用 `watch`。启动任务前确认检查当前返回非 0，启动任务后立即启动监控。
-- 预计不足 10 分钟的普通命令：直接执行，不启动监控。
+- 本地前台命令：使用 `launch` 托管；不要提前单独启动同一命令。
+- 外部任务或会自行 daemonize 的命令：先定义幂等、只读、仅在真实完成时返回 0 的检查，再使用 `watch`。启动任务前确认检查返回非 0，启动后立即启动 monitor。
+- 预计不足 10 分钟的普通命令：直接执行，不使用本 Skill。
 
-## 默认：结束后唤醒原会话
+## 默认续接原会话
 
-从 Codex 会话启动长任务且环境中存在精确 `CODEX_THREAD_ID` 时，默认启用 `--resume-origin-session`。只有用户明确要求“只发飞书”“不要回原会话”或同等意图时才关闭。这是终态事件触发的一次性续接，不要创建 Automation、定时任务，不要根据输出静默时间判断会话是否空闲。
+存在精确 `CODEX_THREAD_ID` 时，默认启用 `--resume-origin-session`；只有用户明确要求“只发飞书”“不要回原会话”时才关闭。缺少线程 ID 时继续任务但不续接，绝不使用 `--last`。
 
-1. 确认环境中存在精确的 `CODEX_THREAD_ID`，不要使用 `--last`。缺少线程 ID 时继续执行任务但不启用续接，并向用户如实说明。
-2. 根据当前任务上下文自行编写 `--session-message`；脚本不固定消息内容。
-3. 消息应让恢复后的 Agent 读取真实状态并决定下一步，避免预先声称成功。可使用 `{status}`、`{summary_file}`、`{task_log}`、`{exit_code}`、`{error}` 等占位符。
-
-示例参数：
+根据当前任务编写简短的 `--session-message`，要求恢复后的 Agent 读取真实状态并自行决定下一步，不要预先声称成功。可使用 `{status}`、`{summary_file}`、`{task_log}`、`{exit_code}`、`{error}` 等占位符：
 
 ```bash
 --resume-origin-session \
---session-message '后台任务已进入 {status}。请读取 {summary_file} 和 {task_log}，基于真实结果自行继续原任务；不要重新启动该任务。'
+--session-message '后台任务已进入 {status}。请读取 {summary_file} 和 {task_log}，基于真实结果继续原任务；不要重新启动该任务。'
 ```
 
-任务进入任一终态时，worker 按以下顺序处理：
-
-1. 如果有可用的 Codex App Server Unix socket，读取精确线程的正式状态。只有 `status.type=active` 表示 Agent 正在运行；仅打开或聚焦一个无运行 turn 的会话仍是 `idle`。
-2. App Server 支持持久消息队列时，将消息一次性加入 `thread/queue/add`；由 App Server 在该线程 idle 后启动。
-3. 较旧 App Server 不支持队列时，订阅 `thread/status/changed`；active 时阻塞等待事件，idle 时才执行一次 `codex exec resume "$CODEX_THREAD_ID" -`。
-4. 连接中断时只做有上限的传输重连；连接正常时绝不轮询线程状态。
-5. 没有 managed App Server socket 的独立 CLI 环境无法读取跨进程实时状态，此时保留原有的一次性 resume，并在状态中明确记录 idle gate 不可用。
-
-消息始终从标准输入传递。续接失败只影响 `origin_session_resume`，不能改写长任务或飞书通知的真实结果。
+让脚本处理会话空闲判定：新版 App Server 使用持久队列，旧版使用 `thread/status/changed` 事件。只有 `active` 表示 turn 正在运行；仅打开或聚焦的空闲会话不算 active。不要另建 Automation、定时任务或基于输出静默时间的轮询。没有 managed App Server socket 时，脚本会记录并使用单次兼容派发。
 
 ## 启动托管命令
 
-根据 Git 根目录或当前目录确定项目名，并写一个不含“完成”前缀的简洁结果短语：
+选择简洁项目名和不含“完成”前缀的结果短语：
 
 ```bash
 python3 "$MONITOR" launch \
@@ -68,9 +56,7 @@ python3 "$MONITOR" launch \
 
 让被托管命令保持前台运行。成功通知固定为 `【<项目名>】：完成<简洁结果表述>`。
 
-## 监控外部完成条件
-
-完成检查必须仅在目标真实达成时返回 0，并且不能改变外部状态：
+## 监控外部条件
 
 ```bash
 python3 "$MONITOR" watch \
@@ -82,29 +68,20 @@ python3 "$MONITOR" watch \
   -- <检查命令> <参数...>
 ```
 
-复杂条件可显式使用 `sh -lc '<只读检查>'`。避免匹配模糊日志关键词；优先检查进程退出状态、明确完成标记、最终产物及其校验结果。
+优先检查进程退出状态、明确完成标记或经过校验的最终产物；避免模糊日志关键词。只有 `watch` 可以轮询，而且只轮询显式外部条件。
 
-## 启动后核验
+## 启动后
 
-1. 读取启动 JSON，确认获得 `task_id`，且状态为 `running` 或 `monitoring`。
-2. 做一次状态核验，不要持续轮询：
-
-```bash
-python3 "$MONITOR" status <task_id>
-```
-
-3. 向用户报告任务 ID、状态文件和日志路径。后台 worker 不占用 Agent 的终端等待；若当前请求还有无需等待长任务即可完成的分析或操作，继续处理。没有其他可做工作时再结束当前回合，Webhook 与原会话续接均不依赖本回合保持运行。
+1. 从启动 JSON 确认 `task_id` 和 `running` 或 `monitoring` 状态。
+2. 只做一次状态核验：`python3 "$MONITOR" status <task_id>`。
+3. 报告任务 ID、状态文件和日志路径。继续处理不依赖长任务结果的工作；没有其他工作时结束回合，不要持续盯终端或反复查状态。
 
 ## 状态纪律
 
-- `completed`：任务成功且飞书返回成功。
-- `completed_notification_failed`：任务成功但通知失败；使用 `retry-notification <task_id>` 重试，不能说通知已发送。
+- `completed`：任务成功且飞书已发送。
+- `completed_notification_failed`：任务成功但飞书失败；可用 `retry-notification <task_id>` 重试，不能说已发送。
 - `failed`、`start_failed`、`monitor_failed`：任务未完成，不发送“完成”消息。
-- `timed_out`：监控超时；托管任务不会被自动终止。检查真实进程状态后再决定是否继续监控或终止。
-- `origin_session_resume.status=waiting_for_idle`：已持久化消息摘要，正在连接 App Server 或等待精确线程的 idle 事件。
-- `origin_session_resume.status=queued`：新版 App Server 的持久队列已接受消息，将在原线程 idle 后启动。
-- `origin_session_resume.status=dispatched`：旧版 App Server 路径已在确认 idle 后启动一次精确续接，或无 socket 的独立 CLI 路径已执行单次兼容派发；后续 CLI 结果查看 `session-resume.log` 和 `idle_gate`。
-- `origin_session_resume.status=failed`：idle 等待超时、线程处于 `systemError` 或续接无法派发；不把它误报为成功。
-- 状态、终态摘要和日志默认保存在 `${CODEX_HOME:-$HOME/.codex}/long-task-monitors/<task_id>/`。
+- `timed_out`：监控超时，不自动终止仍在运行的真实任务。
+- `origin_session_resume` 独立记录续接：`waiting_for_idle` 表示等待；`queued` 或 `dispatched` 表示已接受或已启动一次；`failed` 表示续接失败。不要对 `queued` 或 `dispatched` 再次手动续接。
 
-不要读取、打印或提交 webhook 密钥文件。脚本仅接受官方 Feishu/Lark 机器人 URL，并要求密钥文件权限不宽于 `0600`。
+状态和日志位于 `${CODEX_HOME:-$HOME/.codex}/long-task-monitors/<task_id>/`。不要打印或提交 webhook；脚本只接受官方 Feishu/Lark 地址，并要求密钥文件权限不宽于 `0600`。
