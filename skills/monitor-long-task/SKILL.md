@@ -25,6 +25,7 @@ python3 "$MONITOR" configure
 ## 选择模式
 
 - 本地前台命令：使用 `launch` 托管；不要提前单独启动同一命令。
+- 远程前台命令：禁止本地 `launch -- ssh HOST <长命令>`，也不要用含长生命周期SSH的包装脚本；SSH EOF不可靠，必须在远端主机本地启动monitor。
 - 外部任务或会自行 daemonize 的命令：先定义幂等、只读、仅在真实完成时返回 0 的检查，再使用 `watch`。启动任务前确认检查返回非 0，启动后立即启动 monitor。
 - 预计不足 10 分钟的普通命令：直接执行，不使用本 Skill。
 
@@ -55,6 +56,18 @@ python3 "$MONITOR" launch \
 ```
 
 让被托管命令保持前台运行。成功通知固定为 `【<项目名>】：完成<简洁结果表述>`。
+
+远程任务只用SSH做短暂提交，让远端monitor直接托管真实进程：
+
+```bash
+ssh HOST "python3 REMOTE_MONITOR launch \
+  --project '<项目名>' --summary '<结果>' --cwd '<远端目录>' \
+  --timeout-minutes 240 -- <远端命令>"
+```
+
+若远端命令已独立启动或进程退出不等于业务完成，在远端使用 `watch` 检查经过校验的receipt。
+`launch` 会拒绝直接SSH及可识别的SSH shell包装；只有明确证明SSH EOF就是权威终态时才可使用
+`--allow-ssh-transport-lifetime`，不能把它当作绕过保护的常规选项。
 
 ## 监控外部条件
 

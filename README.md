@@ -131,6 +131,7 @@ flowchart LR
 | 用户意图 | Agent 行为 | 是否轮询 |
 |---|---|---|
 | 托管本地构建、测试或训练命令 | 使用 `launch` 等待进程退出 | 否 |
+| 托管远程主机上的前台命令 | 通过短SSH调用远端本机的 `launch` | 否 |
 | 等待外部任务、明确标记或最终产物 | 使用 `watch` 检查完成条件 | 是，只检查显式外部条件 |
 | 一般长任务 | 默认启用原会话续接 | 否，等待正式 idle 事件 |
 | 明确只发飞书、不要回原会话 | 不启用原会话续接 | 不涉及 |
@@ -266,6 +267,21 @@ python3 "$MONITOR" launch \
 ```
 
 被托管命令应保持前台运行。退出码为 `0` 才视为成功；会自行 daemonize 的程序应改用 `watch`。
+
+不要在本地使用 `launch -- ssh HOST <长命令>`，也不要把长SSH藏在shell脚本中。跳板机或长连接
+可能在远端任务结束后不发送EOF，使monitor将已经完成的任务误报为超时。应让SSH只做短暂提交，
+由远端本机monitor托管真实进程：
+
+```bash
+ssh HOST "python3 /remote/path/long_task_monitor.py launch \
+  --project 'demo-project' --summary '远端评测' \
+  --cwd '/remote/project' --timeout-minutes 720 \
+  -- python3 run_eval.py"
+```
+
+`launch` 默认拒绝直接SSH以及可识别的SSH shell包装。只有明确证明SSH EOF就是权威完成信号时，
+才可显式传入 `--allow-ssh-transport-lifetime`。若远端进程已独立启动，使用远端 `watch`检查经过
+验证的receipt或最终产物。
 
 ### 原会话续接参数
 

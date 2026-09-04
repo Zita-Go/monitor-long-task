@@ -169,6 +169,52 @@ class LongTaskMonitorTests(unittest.TestCase):
         self.assertEqual(failed_state["exit_code"], 7)
         notifier.assert_not_called()
 
+    def test_launch_transport_rejects_direct_and_script_wrapped_ssh(self) -> None:
+        with self.assertRaisesRegex(ValueError, "refuses to treat SSH transport"):
+            monitor.validate_launch_transport(
+                ["ssh", "remote-host", "long-command"],
+                self.root,
+                allow_ssh_transport_lifetime=False,
+            )
+
+        wrapper = self.root / "remote-wrapper.sh"
+        wrapper.write_text(
+            "#!/usr/bin/env bash\nset -eu\nssh remote-host 'long-command'\n",
+            encoding="utf-8",
+        )
+        wrapper.chmod(0o700)
+        with self.assertRaisesRegex(ValueError, "ssh command in"):
+            monitor.validate_launch_transport(
+                [str(wrapper)],
+                self.root,
+                allow_ssh_transport_lifetime=False,
+            )
+        with self.assertRaisesRegex(ValueError, "inline shell command"):
+            monitor.validate_launch_transport(
+                ["bash", "-lc", "ssh remote-host long-command"],
+                self.root,
+                allow_ssh_transport_lifetime=False,
+            )
+
+    def test_launch_transport_requires_explicit_override_for_ssh(self) -> None:
+        monitor.validate_launch_transport(
+            ["ssh", "remote-host", "long-command"],
+            self.root,
+            allow_ssh_transport_lifetime=True,
+        )
+
+        local = self.root / "local.sh"
+        local.write_text(
+            "#!/usr/bin/env bash\n# ssh is mentioned only in a comment\nprintf done\n",
+            encoding="utf-8",
+        )
+        local.chmod(0o700)
+        monitor.validate_launch_transport(
+            [str(local)],
+            self.root,
+            allow_ssh_transport_lifetime=False,
+        )
+
     def test_notification_failure_preserves_task_success(self) -> None:
         task_dir = self.root / "notification-failed"
         task_dir.mkdir()

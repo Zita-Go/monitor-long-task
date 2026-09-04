@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Any
 
 
-__version__ = "0.4.1"
+__version__ = "0.5.0"
 VERSION = 1
 
 
@@ -1159,6 +1159,72 @@ def command_from_remainder(values: list[str]) -> list[str]:
     return command
 
 
+def _read_shell_script_prefix(path: Path, limit: int = 64 * 1024) -> str:
+    try:
+        with path.open("rb") as handle:
+            raw = handle.read(limit)
+    except OSError:
+        return ""
+    return raw.decode("utf-8", errors="ignore")
+
+
+def _shell_script_candidate(command: list[str], cwd: Path) -> tuple[str, str] | None:
+    executable = Path(command[0]).name
+    shell_names = {"bash", "dash", "ksh", "sh", "zsh"}
+    if executable in shell_names:
+        for index, value in enumerate(command[1:], start=1):
+            if value in {"-c", "-lc"} and index + 1 < len(command):
+                return "inline shell command", command[index + 1]
+        candidates = [value for value in command[1:] if not value.startswith("-")]
+        if not candidates:
+            return None
+        candidate = Path(candidates[0]).expanduser()
+    else:
+        candidate = Path(command[0]).expanduser()
+        if os.sep not in command[0]:
+            resolved = shutil.which(command[0])
+            if resolved is None:
+                return None
+            candidate = Path(resolved)
+    if not candidate.is_absolute():
+        candidate = cwd / candidate
+    candidate = candidate.resolve()
+    content = _read_shell_script_prefix(candidate)
+    if not content.startswith("#!"):
+        return None
+    return str(candidate), content
+
+
+def remote_ssh_transport_reason(command: list[str], cwd: Path) -> str | None:
+    if Path(command[0]).name == "ssh":
+        return "direct ssh command"
+    candidate = _shell_script_candidate(command, cwd)
+    if candidate is None:
+        return None
+    label, content = candidate
+    if re.search(r"(?m)^[ \t]*(?:exec[ \t]+)?ssh(?:[ \t]|$)", content):
+        return f"ssh command in {label}"
+    return None
+
+
+def validate_launch_transport(
+    command: list[str],
+    cwd: Path,
+    *,
+    allow_ssh_transport_lifetime: bool,
+) -> None:
+    reason = remote_ssh_transport_reason(command, cwd)
+    if reason is None or allow_ssh_transport_lifetime:
+        return
+    raise ValueError(
+        "launch refuses to treat SSH transport lifetime as remote task completion "
+        f"({reason}). Start monitor-long-task on the remote host with a short SSH "
+        "submission, or start the external task separately and use watch with an "
+        "idempotent receipt check. Use --allow-ssh-transport-lifetime only when SSH "
+        "EOF is deliberately the authoritative completion signal."
+    )
+
+
 def resolve_codex_binary(value: str) -> str:
     candidate = value.strip()
     if not candidate:
@@ -1215,6 +1281,14 @@ def create_task(args: argparse.Namespace, mode: str) -> int:
     if timeout_seconds < 60:
         raise ValueError("timeout must be at least one minute")
     command = command_from_remainder(args.command)
+    if mode == "launch":
+        validate_launch_transport(
+            command,
+            cwd,
+            allow_ssh_transport_lifetime=bool(
+                getattr(args, "allow_ssh_transport_lifetime", False)
+            ),
+        )
     origin_session_resume = build_origin_session_resume(args)
     project = normalize_project(args.project) if args.project else infer_project(cwd)
     summary = normalize_summary(args.summary)
@@ -1391,6 +1465,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     launch = subparsers.add_parser("launch", help="run a command under a detached monitor")
     add_common_arguments(launch)
+    launch.add_argument(
+        "--allow-ssh-transport-lifetime",
+        action="store_true",
+        help="allow SSH EOF to serve as the authoritative task completion signal",
+    )
     launch.set_defaults(handler=lambda args: create_task(args, "launch"))
 
     watch = subparsers.add_parser("watch", help="poll a read-only completion command")
